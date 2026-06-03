@@ -26,8 +26,8 @@ python -B "$SCRIPT_DIR/tm_dre_5level_kmc_production.py" \
   --s45-scale 1 \
   --fixed-W3_NR-scale 1 \
   --fixed-W5_NR-scale 1 \
-  --em-mode in_loop \
-  --em-scale 0.01 \
-  --cutoff-mode physical-time \
-  --simulation-time 2.0
-#  --simulation-length 2000000 \
+  --em-mode off \
+  --em-scale 1 \
+  --simulation-length 2000000 \
+#  --cutoff-mode physical-time \
+#  --simulation-time 2.0
