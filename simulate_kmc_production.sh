@@ -13,9 +13,9 @@ python -B "$SCRIPT_DIR/tm_dre_5level_kmc_production.py" \
   --interaction-mode npt \
   --npt-cr-mode exported \
   --sigma-esa-scale 600 \
-  --s12-scale 40 \
+  --s12-scale 30 \
   --power-sampling-mode centered-gaussian \
-  --power-center 11000 \
+  --power-center 10000 \
   --power-min 3000 \
   --power-max 30000 \
   --power-count 20 \
@@ -26,8 +26,8 @@ python -B "$SCRIPT_DIR/tm_dre_5level_kmc_production.py" \
   --s45-scale 1 \
   --fixed-W3_NR-scale 1 \
   --fixed-W5_NR-scale 1 \
-  --em-mode off \
-  --em-scale 1 \
-  --simulation-length 2000000 \
-#  --cutoff-mode physical-time \
-#  --simulation-time 2.0
+  --em-mode in_loop \
+  --em-scale 0.01 \
+  --cutoff-mode physical-time \
+  --simulation-time 2.0
+#  --simulation-length 2000000 \
