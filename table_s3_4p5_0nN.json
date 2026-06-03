@@ -1,0 +1,179 @@
+{
+  "profile": "table_s3_4p5_0nN",
+  "description": "DRE model fit parameters from SI.pdf Table S3 for the 4.5% Tm3+ ANP at 0 nN.",
+  "table_column": {
+    "tm_percent": 4.5,
+    "force_nN": 0
+  },
+  "simulation_defaults": {
+    "tm_fraction_for_semi_empirical": 0.0456,
+    "excitation_wavelength_nm": 1064.0,
+    "interaction_radius_bound_nm": 3.0,
+    "distance_factor_type": "inverse_cubic"
+  },
+  "spectral_kinetics_defaults": {
+    "phonon_energy_cm^-1": 420.0,
+    "zero_phonon_rate_s^-1": 10000000.0,
+    "mpr_alpha_cm": 0.0069,
+    "n_refract": 1.5,
+    "stokes_shift_cm^-1": 150.0,
+    "energy_transfer_rate_threshold_s^-1": 0.1
+  },
+  "states": [
+    {
+      "dre_state": 1,
+      "kmc_level": 0,
+      "label": "3H6"
+    },
+    {
+      "dre_state": 2,
+      "kmc_level": 1,
+      "label": "3F4"
+    },
+    {
+      "dre_state": 3,
+      "kmc_level": 2,
+      "label": "3H5"
+    },
+    {
+      "dre_state": 4,
+      "kmc_level": 3,
+      "label": "3H4"
+    },
+    {
+      "dre_state": 5,
+      "kmc_level": 4,
+      "label": "3F3"
+    }
+  ],
+  "branching_ratios": {
+    "b31": 0.98,
+    "b32": 0.02,
+    "b41": 0.83,
+    "b42": 0.11,
+    "b43": 0.06,
+    "b51": 0.83,
+    "b52": 0.04,
+    "b53": 0.13,
+    "b54": 0.0
+  },
+  "radiative_rates_s^-1": {
+    "W2R": 164.0,
+    "W3R": 1000.0,
+    "W4R": 532.0,
+    "W5R": 532.0
+  },
+  "nonradiative_rates_s^-1": {
+    "W2NR": 29.0,
+    "W3NR": 94.0,
+    "W4NR": 0.0,
+    "W5NR": 14537.0
+  },
+  "absorption_cross_sections_cm^2": {
+    "sigma_GSA": 3.8e-24,
+    "sigma_ESA": 2.8e-20
+  },
+  "cross_relaxation_rates_s^-1": {
+    "Q21,23": 0.0,
+    "Q21,24": 2339.0,
+    "s12,42": 767.0,
+    "s54,23": 7428.0,
+    "s45,32": 744.0
+  },
+  "dre_channels": [
+    {
+      "name": "s12,42",
+      "transition_a": [
+        1,
+        2
+      ],
+      "transition_b": [
+        4,
+        2
+      ],
+      "description": "(3H6 ; 3H4) -> (3F4 ; 3F4)"
+    },
+    {
+      "name": "Q21,24",
+      "transition_a": [
+        2,
+        1
+      ],
+      "transition_b": [
+        2,
+        4
+      ],
+      "description": "(3F4 ; 3F4) -> (3H6 ; 3H4)"
+    },
+    {
+      "name": "Q21,23",
+      "transition_a": [
+        2,
+        1
+      ],
+      "transition_b": [
+        2,
+        3
+      ],
+      "description": "(3F4 ; 3F4) -> (3H6 ; 3H5)"
+    },
+    {
+      "name": "s54,23",
+      "transition_a": [
+        5,
+        4
+      ],
+      "transition_b": [
+        2,
+        3
+      ],
+      "description": "(3F3 ; 3F4) -> (3H4 ; 3H5)"
+    },
+    {
+      "name": "s45,32",
+      "transition_a": [
+        4,
+        5
+      ],
+      "transition_b": [
+        3,
+        2
+      ],
+      "description": "(3H4 ; 3H5) -> (3F3 ; 3F4)"
+    }
+  ],
+  "output_scaling": {
+    "C": 8215.0,
+    "note": "C scales DRE steady-state populations to experimental emission intensity and is not a kinetic rate."
+  },
+  "production_defaults": {
+    "calibrated": {
+      "pair_rate_source": "calibrated",
+      "one_site_source": "table-s3",
+      "npt_cr_mode": "all",
+      "sigma_esa_scale": 0.4,
+      "q21_scale": 0.1,
+      "s54_scale": 0.03,
+      "s45_scale": 100.0,
+      "s12_scale": 25.0,
+      "w3_nr_scale": 1.0,
+      "w5_nr_scale": 1.0,
+      "em_mode": "off",
+      "em_scale": 0.01
+    },
+    "npt": {
+      "pair_rate_source": "npt",
+      "one_site_source": "npt",
+      "npt_cr_mode": "all",
+      "sigma_esa_scale": 1185.7978647623052,
+      "q21_scale": 1.0,
+      "s54_scale": 1.0,
+      "s45_scale": 1.0,
+      "s12_scale": 21.148836746821555,
+      "w3_nr_scale": 1.0,
+      "w5_nr_scale": 1.0,
+      "em_mode": "off",
+      "em_scale": 1.0
+    }
+  }
+}
