@@ -1,8 +1,0 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-run*/
-generated_geometry/
-nohup.out
-.DS_Store

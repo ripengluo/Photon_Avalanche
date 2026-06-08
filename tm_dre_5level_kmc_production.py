@@ -28,14 +28,14 @@ from NanoParticleTools.inputs.nanoparticle import DopedNanoparticle, SphericalCo
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_NPMC_COMMAND = "/home/rpluo/Desktop/project_MFML_UCNP/RNMC/build/NPMC"
-DEFAULT_POWER_MIN = 1.0e3
-DEFAULT_POWER_MAX = 4.0e4
+DEFAULT_POWER_MIN = 3.0e3
+DEFAULT_POWER_MAX = 3.0e4
 DEFAULT_POWER_COUNT = 8
-DEFAULT_SIMULATION_LENGTH = 200000
+DEFAULT_SIMULATION_LENGTH = 2000000
 DEFAULT_POWER_SAMPLING_MODE = "homogeneous"
 DEFAULT_POWER_GAUSSIAN_CENTER = 1.0e4
 DEFAULT_POWER_GAUSSIAN_SIGMA_DECADES = 0.18
-DEFAULT_INTERACTION_MODE = "calibrated"
+DEFAULT_INTERACTION_MODE = "npt"
 
 Q21_CHANNEL_NAME = "Q21,24"
 S12_CHANNEL_NAME = "s12,42"
@@ -46,10 +46,10 @@ N4_LEVEL = 3
 # Table S1 / run1 geometry approximation used previously:
 # 4.56% Tm core minor/major axes = 20.7 / 32.5 nm, shell thickness = 5.5 nm.
 CORE_MEAN_DIAMETER_NM = (20.7 + 32.5) / 2
-AVERAGE_SHELL_THICKNESS_NM = 5.5
-OUTER_MEAN_DIAMETER_NM = CORE_MEAN_DIAMETER_NM + 2 * AVERAGE_SHELL_THICKNESS_NM
 CORE_RADIUS_A = CORE_MEAN_DIAMETER_NM * 5
-OUTER_RADIUS_A = OUTER_MEAN_DIAMETER_NM * 5
+AVERAGE_SHELL_THICKNESS_NM = 5.5
+AVERAGE_SHELL_THICKNESS_A = AVERAGE_SHELL_THICKNESS_NM * 10
+OUTER_RADIUS_A = CORE_RADIUS_A + AVERAGE_SHELL_THICKNESS_A
 
 FALLBACK_PRODUCTION_DEFAULTS = {
     "calibrated": {
@@ -223,13 +223,15 @@ def resolve_source_np_db(
         source_np_db_path.unlink()
 
     tm_fraction = (
-        float(args.geometry_tm_fraction)
-        if args.geometry_tm_fraction is not None
+        float(args.tm_fraction)
+        if args.tm_fraction is not None
         else float(params["simulation_defaults"]["tm_fraction_for_semi_empirical"])
     )
+    shell_thickness_a = float(args.shell_thickness_a)
+    outer_radius_a = float(args.core_radius_a) + shell_thickness_a
     constraints = [
         SphericalConstraint(float(args.core_radius_a)),
-        SphericalConstraint(float(args.outer_radius_a)),
+        SphericalConstraint(outer_radius_a),
     ]
     nanoparticle = DopedNanoparticle(
         constraints=constraints,
@@ -253,7 +255,8 @@ def resolve_source_np_db(
         "doping_seed": int(args.doping_seed),
         "tm_fraction": tm_fraction,
         "core_radius_A": float(args.core_radius_a),
-        "outer_radius_A": float(args.outer_radius_a),
+        "shell_thickness_A": shell_thickness_a,
+        "outer_radius_A": outer_radius_a,
         "n_dopant_sites": len(nanoparticle.dopant_sites),
     }
     with open(geometry_dir / "source_geometry_metadata.json", "w") as f:
@@ -1543,11 +1546,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Per-seed physical-time cutoff in seconds used in physical-time mode.",
     )
-    parser.add_argument("--tm-fraction", type=float, default=None)
+    parser.add_argument(
+        "--tm-fraction",
+        type=float,
+        default=None,
+        help="Tm dopant fraction used consistently for both geometry generation and spectral kinetics.",
+    )
     parser.add_argument("--doping-seed", type=int, default=23)
-    parser.add_argument("--geometry-tm-fraction", type=float, default=None)
     parser.add_argument("--core-radius-a", type=float, default=CORE_RADIUS_A)
-    parser.add_argument("--outer-radius-a", type=float, default=OUTER_RADIUS_A)
+    parser.add_argument(
+        "--shell-thickness-a",
+        type=float,
+        default=AVERAGE_SHELL_THICKNESS_A,
+        help="Shell thickness in Angstrom; the outer radius is derived as core radius plus shell thickness.",
+    )
     parser.add_argument(
         "--regenerate-geometry",
         action="store_true",
