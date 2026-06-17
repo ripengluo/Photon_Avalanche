@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import shutil
 import sqlite3
 import subprocess
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,9 @@ DEFAULT_POWER_SAMPLING_MODE = "homogeneous"
 DEFAULT_POWER_GAUSSIAN_CENTER = 1.0e4
 DEFAULT_POWER_GAUSSIAN_SIGMA_DECADES = 0.18
 DEFAULT_INTERACTION_MODE = "npt"
+DEFAULT_TRAJECTORY_ARCHIVE_ROOT = Path(
+    "/home/rpluo/Desktop/hdd_large/KMC_trajectories/Tm_4p5-NPT"
+)
 
 Q21_CHANNEL_NAME = "Q21,24"
 S12_CHANNEL_NAME = "s12,42"
@@ -887,6 +892,38 @@ def run_npmc(
         subprocess.run(run_args, stdout=f_std, stderr=f_err, check=True)
 
 
+def archive_initial_state_database(
+    initial_state_db_path: Path,
+    output_dir: Path,
+    archive_root: Path,
+) -> Path:
+    """Move a completed trajectory DB into the archive and replace it with a symlink."""
+    if not initial_state_db_path.exists():
+        raise FileNotFoundError(
+            f"Missing completed trajectory database: {initial_state_db_path}"
+        )
+    if initial_state_db_path.is_symlink():
+        return initial_state_db_path.resolve()
+
+    now = datetime.now()
+    archive_day_dir = archive_root / now.strftime("%Y-%m-%d")
+    archive_day_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = now.strftime("%Y%m%d_%H%M%S_%f")
+    archive_name = f"{output_dir.parent.name}_{output_dir.name}_{timestamp}.sqlite"
+    archived_path = archive_day_dir / archive_name
+    suffix = 1
+    while archived_path.exists():
+        archived_path = archive_day_dir / (
+            f"{output_dir.parent.name}_{output_dir.name}_{timestamp}_{suffix}.sqlite"
+        )
+        suffix += 1
+
+    shutil.move(str(initial_state_db_path), str(archived_path))
+    initial_state_db_path.symlink_to(archived_path.resolve())
+    return archived_path.resolve()
+
+
 def replay_trajectories(
     initial_state_db_path: Path,
     interactions: list[dict[str, Any]],
@@ -1398,6 +1435,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--npmc-command", default=DEFAULT_NPMC_COMMAND)
     parser.add_argument(
+        "--trajectory-archive-root",
+        default=str(DEFAULT_TRAJECTORY_ARCHIVE_ROOT),
+        help=(
+            "Archive root for completed initial_state.sqlite files. Each finished "
+            "trajectory DB is moved into a dated subdirectory and replaced by an "
+            "absolute symlink in the power directory."
+        ),
+    )
+    parser.add_argument(
         "--interaction-mode",
         choices=("calibrated", "npt"),
         default=DEFAULT_INTERACTION_MODE,
@@ -1579,6 +1625,7 @@ def main() -> None:
     config = resolve_production_config(args, params)
     output_root = Path(args.output_root) if args.output_root else next_run_dir()
     output_root.mkdir(parents=True, exist_ok=True)
+    trajectory_archive_root = Path(args.trajectory_archive_root).expanduser()
     source_np_db_path = resolve_source_np_db(args, params, output_root)
     print(f"Using source geometry database: {source_np_db_path}", flush=True)
 
@@ -1604,6 +1651,7 @@ def main() -> None:
         "num_sims": int(args.num_sims),
         "base_seed": int(args.base_seed),
         "thread_count": int(args.thread_count),
+        "trajectory_archive_root": str(trajectory_archive_root.resolve()),
         "simulation_cutoff_mode": args.resolved_cutoff_mode,
         "simulation_step_cutoff": (
             None
@@ -1666,6 +1714,14 @@ def main() -> None:
             continue
 
         run_npmc(np_db_path, initial_state_db_path, output_dir, args)
+        archived_initial_state_db_path = archive_initial_state_database(
+            initial_state_db_path=initial_state_db_path,
+            output_dir=output_dir,
+            archive_root=trajectory_archive_root,
+        )
+        build_records[-1]["archived_initial_state_db_path"] = str(
+            archived_initial_state_db_path
+        )
         replay = replay_trajectories(initial_state_db_path, interactions)
         summary = summarize_run(
             replay=replay,
