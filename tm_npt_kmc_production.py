@@ -1361,12 +1361,14 @@ def archive_initial_state_database(
     output_dir: Path,
     archive_root: Path,
 ) -> Path:
-    """Move a completed trajectory DB into the archive and replace it with a symlink."""
+    """Archive a completed trajectory DB when the configured archive root exists."""
     if not initial_state_db_path.exists():
         raise FileNotFoundError(
             f"Missing completed trajectory database: {initial_state_db_path}"
         )
     if initial_state_db_path.is_symlink():
+        return initial_state_db_path.resolve()
+    if not archive_root.exists():
         return initial_state_db_path.resolve()
 
     now = datetime.now()
@@ -1921,7 +1923,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Archive root for completed initial_state.sqlite files. Each finished "
             "trajectory DB is moved into a dated subdirectory and replaced by an "
-            "absolute symlink in the power directory."
+            "absolute symlink in the power directory. If the archive root does "
+            "not exist, the trajectory DB is left in the local power directory."
         ),
     )
     parser.add_argument(
