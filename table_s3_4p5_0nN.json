@@ -147,23 +147,7 @@
     "note": "C scales DRE steady-state populations to experimental emission intensity and is not a kinetic rate."
   },
   "production_defaults": {
-    "calibrated": {
-      "pair_rate_source": "calibrated",
-      "one_site_source": "table-s3",
-      "npt_cr_mode": "all",
-      "sigma_esa_scale": 0.4,
-      "q21_scale": 0.1,
-      "s54_scale": 0.03,
-      "s45_scale": 100.0,
-      "s12_scale": 25.0,
-      "w3_nr_scale": 1.0,
-      "w5_nr_scale": 1.0,
-      "em_mode": "off",
-      "em_scale": 0.01
-    },
     "npt": {
-      "pair_rate_source": "npt",
-      "one_site_source": "npt",
       "npt_cr_mode": "all",
       "sigma_esa_scale": 1185.7978647623052,
       "q21_scale": 1.0,
@@ -173,7 +157,10 @@
       "w3_nr_scale": 1.0,
       "w5_nr_scale": 1.0,
       "em_mode": "off",
-      "em_scale": 1.0
+      "em_scale": 1.0,
+      "surface_quench_mode": "off",
+      "surface_species": "Surface",
+      "surface_fraction": 0.2
     }
   }
 }

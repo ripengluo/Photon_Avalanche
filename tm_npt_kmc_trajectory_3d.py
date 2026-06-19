@@ -1,4 +1,4 @@
-"""Plot one kMC trajectory plus a criticality GIF and cluster-size distribution."""
+"""Plot one NPT kMC trajectory plus a criticality GIF and cluster-size distribution."""
 
 from __future__ import annotations
 
@@ -78,7 +78,13 @@ def load_site_positions(np_db_path: Path) -> np.ndarray:
 
 
 def load_manifest(run_dir: Path) -> dict[str, Any]:
-    return load_json(run_dir / "dre_5level_interaction_manifest.json")
+    for name in ("npt_interaction_manifest.json", "dre_5level_interaction_manifest.json"):
+        path = run_dir / name
+        if path.exists():
+            return load_json(path)
+    raise FileNotFoundError(
+        f"Could not find npt_interaction_manifest.json or dre_5level_interaction_manifest.json in {run_dir}"
+    )
 
 
 def load_interactions(manifest: dict[str, Any]) -> tuple[dict[int, dict[str, Any]], int]:

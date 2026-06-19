@@ -33,7 +33,7 @@ from matplotlib import pyplot as plt
 from matplotlib.ticker import FixedLocator, FuncFormatter
 from scipy.spatial import cKDTree
 
-from tm_dre_5level_kmc_trajectory_3d import (
+from tm_npt_kmc_trajectory_3d import (
     RAD_800_LABEL,
     iter_trajectory_rows,
     load_interactions,
