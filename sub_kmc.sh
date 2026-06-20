@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH -p lr5 -A pc_lnpmc -q lr_normal
-#SBATCH -N 1 -t 72:00:00 -n 80 -c 1 --mem=32G
-#SBATCH -J kmc_EM_1p0
+#SBATCH -p cm1 -A pc_lnpmc -q cm1_normal
+#SBATCH -N 1 -t 48:00:00 -n 48 -c 1 --mem=192G
+#SBATCH -J kmc_npt12_parallel
 
 set -euo pipefail
 
@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # With the current Slurm allocation (-n 80) and --thread-count 8, the script
 # will run up to floor(80 / 8) = 10 powers concurrently.
 
-python -B "$SCRIPT_DIR/tm_npt_kmc_production.py" \
+python -B "./tm_npt_kmc_production.py" --npmc-command "/global/home/users/rluo/project_UCNP/RNMC/build/NPMC" \
   --core-radius-a 130 \
   --surface-quench-mode outer_layer \
   --shell-thickness-a 25 \
@@ -33,7 +33,7 @@ python -B "$SCRIPT_DIR/tm_npt_kmc_production.py" \
   --power-center 10000 \
   --power-min 3000 \
   --power-max 30000 \
-  --power-count 10 \
+  --power-count 12 \
   --num-sims 8 \
   --thread-count 8 \
   --q21-scale 1 \
