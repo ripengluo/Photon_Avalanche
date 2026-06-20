@@ -5,8 +5,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
 # Archived EM_effect-4nm/1.0 baseline:
 # - 4 nm core (core radius 40 A)
 # - 5.5 nm shell (shell thickness 55 A)
@@ -21,7 +19,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # With the current Slurm allocation (-n 80) and --thread-count 8, the script
 # will run up to floor(80 / 8) = 10 powers concurrently.
 
-python -B "./tm_npt_kmc_production.py" --npmc-command "/global/home/users/rluo/project_UCNP/RNMC/build/NPMC" \
+python -B "./tm_npt_kmc_production.py" \
   --core-radius-a 130 \
   --surface-quench-mode outer_layer \
   --shell-thickness-a 25 \
