@@ -26,6 +26,7 @@ from NanoParticleTools.inputs.nanoparticle import DopedNanoparticle, SphericalCo
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_NPMC_COMMAND = "/home/rpluo/Desktop/project_MFML_UCNP/RNMC/build/NPMC"
+FALLBACK_NPMC_COMMAND = "/global/home/users/rluo/project_UCNP/RNMC/build/NPMC"
 DEFAULT_POWER_MIN = 3.0e3
 DEFAULT_POWER_MAX = 3.0e4
 DEFAULT_POWER_COUNT = 8
@@ -220,6 +221,18 @@ def default_power_parallel_total_slots() -> int | None:
     if cpu_count is not None:
         return int(cpu_count)
     return None
+
+
+def resolve_npmc_command(npmc_command: str) -> str:
+    """Resolve the NPMC binary path with a built-in HPC fallback."""
+    requested = Path(npmc_command).expanduser()
+    if requested.exists():
+        return str(requested)
+    if npmc_command == DEFAULT_NPMC_COMMAND:
+        fallback = Path(FALLBACK_NPMC_COMMAND)
+        if fallback.exists():
+            return str(fallback)
+    return npmc_command
 
 
 def resolve_source_np_db(
@@ -1916,7 +1929,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output directory. Defaults to the first available runN directory.",
     )
-    parser.add_argument("--npmc-command", default=DEFAULT_NPMC_COMMAND)
+    parser.add_argument(
+        "--npmc-command",
+        default=DEFAULT_NPMC_COMMAND,
+        help=(
+            "Path to the NPMC binary. If the default desktop path is missing, "
+            "the script falls back automatically to the HPC path."
+        ),
+    )
     parser.add_argument(
         "--trajectory-archive-root",
         default=str(DEFAULT_TRAJECTORY_ARCHIVE_ROOT),
@@ -2120,6 +2140,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    args.npmc_command = resolve_npmc_command(args.npmc_command)
     (
         args.resolved_cutoff_mode,
         args.resolved_simulation_length,
