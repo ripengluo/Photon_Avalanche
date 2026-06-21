@@ -25,7 +25,7 @@ python -B "./tm_npt_kmc_production.py" \
   --shell-thickness-a 25 \
   --tm-fraction 0.0456 \
   --npt-cr-mode exported \
-  --sigma-esa-scale 600 \
+  --sigma-esa-scale 400 \
   --s12-scale 30 \
   --power-sampling-mode centered-gaussian \
   --power-center 10000 \

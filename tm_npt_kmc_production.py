@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -233,6 +234,58 @@ def resolve_npmc_command(npmc_command: str) -> str:
         if fallback.exists():
             return str(fallback)
     return npmc_command
+
+
+def resolve_local_db_staging_root() -> Path | None:
+    """Return a node-local staging root for heavy SQLite writes when available."""
+    override = os.environ.get("KMC_LOCAL_STAGING_ROOT")
+    candidate_roots: list[Path] = []
+    if override:
+        candidate_roots.append(Path(override).expanduser())
+    if os.environ.get("SLURM_JOB_ID") is not None:
+        candidate_roots.extend(
+            Path(raw)
+            for raw in (
+                "/dev/shm",
+                os.environ.get("SLURM_TMPDIR"),
+                os.environ.get("TMPDIR"),
+                "/tmp",
+            )
+            if raw
+        )
+    for candidate in candidate_roots:
+        if candidate.is_dir() and os.access(candidate, os.W_OK | os.X_OK):
+            return candidate.resolve()
+    return None
+
+
+def prepare_power_db_work_dir(
+    final_output_dir: Path,
+    *,
+    local_db_staging_root: Path | None,
+    dry_run: bool,
+) -> Path:
+    """Choose where the per-power SQLite databases should be built and mutated."""
+    final_output_dir.mkdir(parents=True, exist_ok=True)
+    if dry_run or local_db_staging_root is None:
+        return final_output_dir
+    staging_parent = local_db_staging_root / "tm_npt_kmc_staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    prefix = f"{final_output_dir.parent.name}_{final_output_dir.name}_"
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=staging_parent))
+
+
+def move_output_file(source_path: Path, destination_path: Path) -> Path:
+    """Move one file into its final output location, replacing any stale file."""
+    if not source_path.exists():
+        raise FileNotFoundError(f"Missing output artifact: {source_path}")
+    if source_path.resolve() == destination_path.resolve():
+        return destination_path.resolve()
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    if destination_path.is_symlink() or destination_path.exists():
+        destination_path.unlink()
+    shutil.move(str(source_path), str(destination_path))
+    return destination_path.resolve()
 
 
 def resolve_source_np_db(
@@ -1301,14 +1354,25 @@ def run_power_point(
     config: dict[str, Any],
     args: argparse.Namespace,
     trajectory_archive_root: Path,
+    local_db_staging_root: Path | None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Build and optionally run one power point."""
     output_dir = output_root / f"power_{power_index:02d}_{power:.6g}"
+    db_work_dir = prepare_power_db_work_dir(
+        output_dir,
+        local_db_staging_root=local_db_staging_root,
+        dry_run=bool(args.dry_run),
+    )
     print(
         f"[power {power_index + 1}/{power_count}] building {power:.6g} W cm^-2 "
         f"for the NPT rate model",
         flush=True,
     )
+    if db_work_dir != output_dir:
+        print(
+            f"[power {power_index + 1}/{power_count}] staging SQLite writes in {db_work_dir}",
+            flush=True,
+        )
     interactions, manifest = build_custom_interactions(
         params=params,
         source_np_db_path=source_np_db_path,
@@ -1319,7 +1383,7 @@ def run_power_point(
     )
     np_db_path, initial_state_db_path = write_custom_npmc_databases(
         source_np_db_path=source_np_db_path,
-        output_dir=output_dir,
+        output_dir=db_work_dir,
         interactions=interactions,
         interaction_radius_bound_nm=float(
             params["simulation_defaults"]["interaction_radius_bound_nm"]
@@ -1338,21 +1402,13 @@ def run_power_point(
         "output_dir": str(output_dir.resolve()),
         "interaction_count": int(len(interactions)),
         "manifest_path": str(manifest_path.resolve()),
-        "np_db_path": str(np_db_path.resolve()),
-        "initial_state_db_path": str(initial_state_db_path.resolve()),
+        "np_db_path": str((output_dir / "np.sqlite").resolve()),
+        "initial_state_db_path": str((output_dir / "initial_state.sqlite").resolve()),
     }
     if args.dry_run:
         return build_record, None
 
     run_npmc(np_db_path, initial_state_db_path, output_dir, args)
-    archived_initial_state_db_path = archive_initial_state_database(
-        initial_state_db_path=initial_state_db_path,
-        output_dir=output_dir,
-        archive_root=trajectory_archive_root,
-    )
-    build_record["archived_initial_state_db_path"] = str(
-        archived_initial_state_db_path
-    )
     replay = replay_trajectories(initial_state_db_path, interactions)
     summary = summarize_run(
         replay=replay,
@@ -1366,23 +1422,43 @@ def run_power_point(
     )
     with open(output_dir / "npt_run_summary.json", "w") as f:
         json.dump(json_safe(summary), f, indent=2)
+
+    move_output_file(np_db_path, output_dir / "np.sqlite")
+    archived_initial_state_db_path = finalize_initial_state_database(
+        initial_state_db_path=initial_state_db_path,
+        output_dir=output_dir,
+        archive_root=trajectory_archive_root,
+    )
+    build_record["np_db_path"] = str((output_dir / "np.sqlite").resolve())
+    build_record["initial_state_db_path"] = str(
+        (output_dir / "initial_state.sqlite").resolve()
+    )
+    build_record["archived_initial_state_db_path"] = str(archived_initial_state_db_path)
+    if db_work_dir != output_dir and db_work_dir.exists():
+        db_work_dir.rmdir()
     return build_record, summary
 
 
-def archive_initial_state_database(
+def finalize_initial_state_database(
     initial_state_db_path: Path,
     output_dir: Path,
     archive_root: Path,
 ) -> Path:
-    """Archive a completed trajectory DB when the configured archive root exists."""
+    """Materialize the completed trajectory DB in the final output location."""
     if not initial_state_db_path.exists():
         raise FileNotFoundError(
             f"Missing completed trajectory database: {initial_state_db_path}"
         )
+    final_initial_state_db_path = output_dir / "initial_state.sqlite"
     if initial_state_db_path.is_symlink():
-        return initial_state_db_path.resolve()
+        archived_path = initial_state_db_path.resolve()
+        if final_initial_state_db_path != initial_state_db_path:
+            if final_initial_state_db_path.is_symlink() or final_initial_state_db_path.exists():
+                final_initial_state_db_path.unlink()
+            final_initial_state_db_path.symlink_to(archived_path)
+        return archived_path
     if not archive_root.exists():
-        return initial_state_db_path.resolve()
+        return move_output_file(initial_state_db_path, final_initial_state_db_path)
 
     now = datetime.now()
     archive_day_dir = archive_root / now.strftime("%Y-%m-%d")
@@ -1399,7 +1475,9 @@ def archive_initial_state_database(
         suffix += 1
 
     shutil.move(str(initial_state_db_path), str(archived_path))
-    initial_state_db_path.symlink_to(archived_path.resolve())
+    if final_initial_state_db_path.is_symlink() or final_initial_state_db_path.exists():
+        final_initial_state_db_path.unlink()
+    final_initial_state_db_path.symlink_to(archived_path.resolve())
     return archived_path.resolve()
 
 
@@ -2173,6 +2251,15 @@ def main() -> None:
         power_parallel_workers = 1
     power_parallel_workers = min(power_parallel_workers, len(powers))
     auto_power_parallel = power_parallel_workers > 1
+    local_db_staging_root = (
+        None if args.dry_run else resolve_local_db_staging_root()
+    )
+    if local_db_staging_root is not None:
+        print(
+            "Using node-local staging for per-power SQLite writes: "
+            f"{local_db_staging_root}",
+            flush=True,
+        )
 
     root_config = {
         "profile": params["profile"],
@@ -2198,6 +2285,11 @@ def main() -> None:
             None
             if power_parallel_total_slots is None
             else int(power_parallel_total_slots)
+        ),
+        "local_db_staging_root": (
+            None
+            if local_db_staging_root is None
+            else str(local_db_staging_root.resolve())
         ),
         "trajectory_archive_root": str(trajectory_archive_root.resolve()),
         "simulation_cutoff_mode": args.resolved_cutoff_mode,
@@ -2240,6 +2332,7 @@ def main() -> None:
                     config=config,
                     args=args,
                     trajectory_archive_root=trajectory_archive_root,
+                    local_db_staging_root=local_db_staging_root,
                 ): (power_index, power)
                 for power_index, power in power_jobs
             }
@@ -2262,6 +2355,7 @@ def main() -> None:
                 config=config,
                 args=args,
                 trajectory_archive_root=trajectory_archive_root,
+                local_db_staging_root=local_db_staging_root,
             )
             build_records.append(build_record)
             if summary is not None:
