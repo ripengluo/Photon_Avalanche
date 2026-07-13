@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import sqlite3
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -31,12 +32,67 @@ DEFAULT_MAX_POINTS = 6000
 DEFAULT_MAX_MARKERS = 4000
 DEFAULT_GIF_FRAMES = 120
 DEFAULT_GIF_FPS = 12
+DEFAULT_GIF_MAX_TIME_S = 0.1
 ACTIVE_CLUSTER_STATES = (N2_LEVEL, N4_LEVEL, N5_LEVEL)
 ACTIVE_CLUSTER_STATE_LABEL = "n2+n4+n5 (3F4 + 3H4 + 3F3)"
 DEFAULT_EXACT_CLUSTER_SIZE_LIMIT = 50
 DEFAULT_PSEUDO_ZERO_HEIGHT = 2e-4
 
-STATE_PALETTE = np.asarray(
+def wrap_text_for_plot(text: Any, width: int = 92) -> str:
+    """Wrap plot text so it stays inside the saved image boundary."""
+    text = str(text)
+    if not text:
+        return ""
+    wrapped_lines: list[str] = []
+    for raw_line in text.splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            wrapped_lines.append("")
+            continue
+        wrapped_lines.extend(
+            textwrap.wrap(
+                raw_line,
+                width=max(int(width), 20),
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+            or [raw_line]
+        )
+    return "\n".join(wrapped_lines)
+
+
+def wrap_path_for_plot(path: Path | str, width: int = 92) -> str:
+    """Wrap long filesystem paths at slash boundaries when possible."""
+    text = Path(path).as_posix() if isinstance(path, Path) else str(path)
+    if len(text) <= width:
+        return text
+    slash_spaced = text.replace("/", "/ ")
+    wrapped = wrap_text_for_plot(slash_spaced, width=width)
+    return wrapped.replace("/ ", "/")
+
+
+def set_wrapped_suptitle(
+    fig: Any,
+    title: str,
+    detail_lines: list[str],
+    width: int = 96,
+    fontsize: float = 10.0,
+    y: float = 0.985,
+) -> int:
+    """Add a multi-line figure title and return the number of lines used."""
+    parts = [wrap_text_for_plot(title, width=width)]
+    parts.extend(wrap_text_for_plot(line, width=width) for line in detail_lines if str(line).strip())
+    text = "\n".join(part for part in parts if part)
+    fig.suptitle(text, fontsize=fontsize, y=y, va="top", ha="center", multialignment="center")
+    return max(1, len(text.splitlines()))
+
+
+def axes_top_for_title(line_count: int, default_top: float = 0.88) -> float:
+    """Reserve more headroom as the wrapped title becomes taller."""
+    return max(0.66, float(default_top) - max(int(line_count) - 2, 0) * 0.038)
+
+
+BASE_STATE_PALETTE = np.asarray(
     [
         to_rgba("#D9D9D9"),
         to_rgba("#F4A261"),
@@ -46,6 +102,8 @@ STATE_PALETTE = np.asarray(
     ],
     dtype=float,
 )
+STATE_PALETTE = BASE_STATE_PALETTE.copy()
+N2_VISIBLE_COLOR = STATE_PALETTE[N2_LEVEL]
 
 
 @dataclass
@@ -69,12 +127,18 @@ def load_site_count(np_db_path: Path) -> int:
     return int(row[0])
 
 
-def load_site_positions(np_db_path: Path) -> np.ndarray:
+def load_site_geometry(np_db_path: Path) -> tuple[np.ndarray, np.ndarray]:
     with sqlite3.connect(np_db_path) as con:
-        rows = con.execute("SELECT x, y, z FROM sites ORDER BY site_id").fetchall()
+        rows = con.execute("SELECT x, y, z, species_id FROM sites ORDER BY site_id").fetchall()
     if not rows:
         raise ValueError(f"No site coordinates in {np_db_path}")
-    return np.asarray(rows, dtype=float)
+    positions = np.asarray([row[:3] for row in rows], dtype=float)
+    species_ids = np.asarray([row[3] for row in rows], dtype=np.int32)
+    return positions, species_ids
+
+
+def load_site_positions(np_db_path: Path) -> np.ndarray:
+    return load_site_geometry(np_db_path)[0]
 
 
 def load_manifest(run_dir: Path) -> dict[str, Any]:
@@ -99,6 +163,101 @@ def load_interactions(manifest: dict[str, Any]) -> tuple[dict[int, dict[str, Any
     if rad_800_id is None:
         raise ValueError(f"Could not find {RAD_800_LABEL!r}")
     return interactions, int(rad_800_id)
+
+
+def infer_state_count(interactions: dict[int, dict[str, Any]]) -> int:
+    max_state = 0
+    for row in interactions.values():
+        for key in ("left_state_1", "right_state_1", "left_state_2", "right_state_2"):
+            value = int(row[key])
+            if value >= 0 and value > max_state:
+                max_state = value
+    return max_state + 1
+
+
+def build_state_palette(state_count: int) -> np.ndarray:
+    if state_count <= len(BASE_STATE_PALETTE):
+        return BASE_STATE_PALETTE[:state_count].copy()
+    extra_count = state_count - len(BASE_STATE_PALETTE)
+    cmap = plt.get_cmap("tab20")
+    extra = np.asarray([cmap(i / max(extra_count, 1)) for i in range(extra_count)], dtype=float)
+    return np.concatenate([BASE_STATE_PALETTE, extra], axis=0)
+
+
+def build_site_display_mask(species_ids: np.ndarray, site_filter: str) -> np.ndarray:
+    site_filter = str(site_filter)
+    if site_filter == "all":
+        return np.ones(np.asarray(species_ids).shape[0], dtype=bool)
+    if site_filter == "tm-only":
+        return np.asarray(species_ids, dtype=np.int32) == 0
+    raise ValueError(f"Unknown gif site filter: {site_filter}")
+
+
+def resolve_projection(projection: str) -> tuple[tuple[int, ...], tuple[str, ...], bool]:
+    projection = str(projection)
+    if projection == "3d":
+        return (0, 1, 2), ("x", "y", "z"), True
+    mapping = {
+        "xy": ((0, 1), ("x", "y")),
+        "xz": ((0, 2), ("x", "z")),
+        "yz": ((1, 2), ("y", "z")),
+    }
+    if projection in mapping:
+        axes, labels = mapping[projection]
+        return axes, labels, False
+    raise ValueError(f"Unknown gif projection: {projection}")
+
+
+def style_site_colors(states: np.ndarray, packed: bool = False, base_size: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+    colors = state_to_rgba(states).copy()
+    active_mask = build_cluster_active_mask(states)
+    if packed:
+        colors[:, 3] = 1.0
+        size = 16.0 if base_size is None else float(base_size)
+        sizes = np.where(active_mask, size * 1.12, size)
+    else:
+        colors[:, 3] = np.where(active_mask, 0.92, 0.18)
+        sizes = np.where(active_mask, 12.0, 4.0)
+    return colors, sizes
+
+
+def project_isometric_positions(positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    theta = math.radians(45.0)
+    phi = math.radians(35.264389682754654)
+    rot_z = np.asarray(
+        [
+            [math.cos(theta), -math.sin(theta), 0.0],
+            [math.sin(theta), math.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    rot_x = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, math.cos(phi), -math.sin(phi)],
+            [0.0, math.sin(phi), math.cos(phi)],
+        ],
+        dtype=float,
+    )
+    rotated = np.asarray(positions, dtype=float) @ rot_z.T @ rot_x.T
+    return rotated[:, :2], rotated[:, 2]
+
+
+def estimate_packed_marker_size(ax: Any, projected_positions: np.ndarray) -> float:
+    projected_positions = np.asarray(projected_positions, dtype=float)
+    if projected_positions.shape[0] < 2:
+        return 18.0
+    tree = cKDTree(projected_positions)
+    distances, _ = tree.query(projected_positions, k=2)
+    spacing = float(np.median(distances[:, 1]))
+    if not np.isfinite(spacing) or spacing <= 0:
+        return 18.0
+    origin = np.asarray(ax.transData.transform((0.0, 0.0)), dtype=float)
+    unit = np.asarray(ax.transData.transform((1.0, 0.0)), dtype=float)
+    points_per_data = float(np.linalg.norm(unit - origin) * 72.0 / ax.figure.dpi)
+    diameter_points = max(2.5, spacing * points_per_data * 0.92)
+    return float(diameter_points**2)
 
 
 def iter_trajectory_rows(initial_state_db_path: Path, seed: int | None = None) -> Iterator[tuple[Any, ...]]:
@@ -157,7 +316,7 @@ def replay_seed_summary(
 ) -> SeedSummary:
     site_count = load_site_count(np_db_path)
     site_states = np.zeros(site_count, dtype=np.int8)
-    counts = np.zeros(5, dtype=np.int64)
+    counts = np.zeros(len(STATE_PALETTE), dtype=np.int64)
     counts[0] = site_count
     previous_time = 0.0
     n4_integral = 0.0
@@ -234,7 +393,7 @@ def extract_seed_trajectory(
 ) -> dict[str, Any]:
     site_count = load_site_count(np_db_path)
     site_states = np.zeros(site_count, dtype=np.int8)
-    counts = np.zeros(5, dtype=np.int64)
+    counts = np.zeros(len(STATE_PALETTE), dtype=np.int64)
     counts[0] = site_count
 
     times = [0.0]
@@ -392,9 +551,11 @@ def build_movie_frames(
     seed: int,
     cluster_cutoff_nm: float,
     frame_count: int,
+    max_time_s: float,
+    site_filter: str = "all",
 ) -> dict[str, Any]:
     site_count = load_site_count(np_db_path)
-    positions = load_site_positions(np_db_path)
+    positions, species_ids = load_site_geometry(np_db_path)
     if len(positions) != site_count:
         raise ValueError("Site position count mismatch")
 
@@ -402,15 +563,25 @@ def build_movie_frames(
     if n_events <= 0:
         raise ValueError(f"Seed {seed} not found")
 
-    event_indices = set(downsample_indices(n_events, max(1, max(2, int(frame_count)) - 1)).tolist())
+    display_mask = build_site_display_mask(species_ids, site_filter)
+    if not np.any(display_mask):
+        raise ValueError(f"GIF site filter {site_filter!r} removed all sites")
+    display_site_ids = np.flatnonzero(display_mask).astype(np.int32)
+    display_lookup = np.full(site_count, -1, dtype=np.int32)
+    display_lookup[display_site_ids] = np.arange(display_site_ids.size, dtype=np.int32)
+    display_positions = positions[display_mask]
+
+    if max_time_s <= 0.0:
+        raise ValueError("GIF max time must be positive")
     neighbor_pairs = build_neighbor_pairs(positions, float(cluster_cutoff_nm))
 
     site_states = np.zeros(site_count, dtype=np.int8)
-    counts = np.zeros(5, dtype=np.int64)
+    counts = np.zeros(len(STATE_PALETTE), dtype=np.int64)
     counts[0] = site_count
     previous_time = 0.0
     n4_integral = 0.0
     rad_800_count = 0
+    truncated_event_indices: list[int] = []
 
     frames: list[dict[str, Any]] = []
     initial_stats = compute_active_cluster_statistics(site_states, neighbor_pairs)
@@ -447,7 +618,48 @@ def build_movie_frames(
         if interaction_id == rad_800_id:
             rad_800_count += 1
 
-        if event_index in event_indices:
+        if event_time <= float(max_time_s):
+            truncated_event_indices.append(int(event_index))
+        else:
+            previous_time = event_time
+            break
+        previous_time = event_time
+
+    if truncated_event_indices:
+        sampled_event_indices = set(
+            truncated_event_indices[idx]
+            for idx in downsample_indices(len(truncated_event_indices), max(1, max(2, int(frame_count)) - 1)).tolist()
+        )
+    else:
+        sampled_event_indices = set()
+
+    site_states = np.zeros(site_count, dtype=np.int8)
+    counts = np.zeros(len(STATE_PALETTE), dtype=np.int64)
+    counts[0] = site_count
+    previous_time = 0.0
+    n4_integral = 0.0
+    rad_800_count = 0
+
+    for event_index, row in enumerate(iter_trajectory_rows(initial_state_db_path, seed=seed)):
+        row_seed, step, event_time, site_id_1, site_id_2, interaction_id = row
+        event_time = float(event_time)
+        if event_time > float(max_time_s):
+            break
+        site_id_1 = int(site_id_1)
+        site_id_2 = int(site_id_2)
+        interaction_id = int(interaction_id)
+        interaction = interactions[interaction_id]
+
+        dt = event_time - previous_time
+        if dt < -1e-12:
+            raise ValueError(f"Time decreased for seed {row_seed} step {step}")
+        n4_integral += float(counts[N4_LEVEL]) * max(dt, 0.0)
+
+        apply_interaction(site_states, counts, interaction, site_id_1, site_id_2, int(row_seed), int(step))
+        if interaction_id == rad_800_id:
+            rad_800_count += 1
+
+        if event_index in sampled_event_indices:
             stats = compute_active_cluster_statistics(site_states, neighbor_pairs)
             frames.append(
                 {
@@ -470,49 +682,125 @@ def build_movie_frames(
     n4_avg = n4_integral / (float(site_count) * total_time) if total_time > 0 else 0.0
     return {
         "seed": int(seed),
-        "positions": positions,
+        "positions": display_positions,
+        "display_site_ids": display_site_ids,
+        "display_lookup": display_lookup,
+        "display_site_count": int(display_positions.shape[0]),
         "frames": frames,
         "event_count": int(n_events),
         "rad_800_count": int(rad_800_count),
         "n4_avg": float(n4_avg),
         "cluster_cutoff_nm": float(cluster_cutoff_nm),
+        "site_filter": str(site_filter),
         "active_states": [int(v) for v in ACTIVE_CLUSTER_STATES],
         "active_state_label": ACTIVE_CLUSTER_STATE_LABEL,
+        "max_time_s": float(max_time_s),
     }
 
 
-def build_criticality_gif(run_dir: Path, movie: dict[str, Any], output_path: Path, fps: int) -> None:
+def build_criticality_gif(
+    run_dir: Path,
+    movie: dict[str, Any],
+    output_path: Path,
+    fps: int,
+    projection: str = "3d",
+) -> None:
     positions = np.asarray(movie["positions"], dtype=float)
+    display_site_ids = np.asarray(movie["display_site_ids"], dtype=np.int32)
+    display_lookup = np.asarray(movie["display_lookup"], dtype=np.int32)
     frames = movie["frames"]
-    x, y, z = positions.T
-    mins = positions.min(axis=0)
-    maxs = positions.max(axis=0)
-    center = 0.5 * (mins + maxs)
-    radius = max(0.5 * float(np.max(np.maximum(maxs - mins, 1e-6))) * 1.005, 1e-3)
+    projection = str(projection)
+    packed_mode = projection != "3d"
+    packed_marker_size: float | None = None
 
-    fig = plt.figure(figsize=(8.4, 8.0))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.set_xlim(float(center[0] - radius), float(center[0] + radius))
-    ax.set_ylim(float(center[1] - radius), float(center[1] + radius))
-    ax.set_zlim(float(center[2] - radius), float(center[2] + radius))
-    ax.set_box_aspect((1.0, 1.0, 1.0))
-    ax.view_init(elev=22, azim=35)
-    ax.set_xlabel("x (nm)")
-    ax.set_ylabel("y (nm)")
-    ax.set_zlabel("z (nm)")
+    if projection == "iso":
+        plot_positions, depth = project_isometric_positions(positions)
+        projection_labels = ("u", "v")
+    elif projection == "3d":
+        plot_positions = positions
+        depth = np.zeros(positions.shape[0], dtype=float)
+        projection_labels = ("x", "y", "z")
+        packed_mode = False
+    else:
+        projection_axes, projection_labels, is_3d = resolve_projection(projection)
+        if is_3d:
+            plot_positions = positions
+            depth = np.zeros(positions.shape[0], dtype=float)
+            packed_mode = False
+        else:
+            plot_positions = positions[:, projection_axes]
+            depth_axis = {"xy": 2, "xz": 1, "yz": 0}[projection]
+            depth = positions[:, depth_axis]
 
-    first_states = np.asarray(frames[0]["states"], dtype=np.int8)
-    base = ax.scatter(
-        x,
-        y,
-        z,
-        c=state_to_rgba(first_states),
-        s=np.where(build_cluster_active_mask(first_states), 13.0, 5.8),
-        depthshade=False,
-        linewidths=0.0,
-    )
-    cluster = ax.scatter([], [], [], s=42, facecolors="none", edgecolors="gold", linewidths=1.0, depthshade=False)
-    flash = ax.scatter([], [], [], s=120, marker="*", c="crimson", depthshade=False)
+    if packed_mode:
+        sort_order = np.argsort(depth, kind="mergesort")
+        render_positions = np.asarray(plot_positions[sort_order], dtype=float)
+        render_site_ids = np.asarray(display_site_ids[sort_order], dtype=np.int32)
+        render_lookup = np.full(display_lookup.size, -1, dtype=np.int32)
+        render_lookup[render_site_ids] = np.arange(render_site_ids.size, dtype=np.int32)
+
+        mins = render_positions.min(axis=0)
+        maxs = render_positions.max(axis=0)
+        center = 0.5 * (mins + maxs)
+        radius = max(0.5 * float(np.max(np.maximum(maxs - mins, 1e-6))) * 1.005, 1e-3)
+
+        fig, ax = plt.subplots(figsize=(8.4, 8.0))
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(float(center[0] - radius), float(center[0] + radius))
+        ax.set_ylim(float(center[1] - radius), float(center[1] + radius))
+        ax.set_xlabel(f"{projection_labels[0]} (nm)")
+        ax.set_ylabel(f"{projection_labels[1]} (nm)")
+        ax.set_facecolor("#fbfbfb")
+
+        fig.canvas.draw()
+        packed_marker_size = estimate_packed_marker_size(ax, render_positions)
+        first_states = np.asarray(frames[0]["states"], dtype=np.int8)[render_site_ids]
+        first_colors, first_sizes = style_site_colors(first_states, packed=True, base_size=packed_marker_size)
+        base = ax.scatter(
+            render_positions[:, 0],
+            render_positions[:, 1],
+            c=first_colors,
+            s=first_sizes,
+            linewidths=0.0,
+            edgecolors="none",
+        )
+        cluster = ax.scatter([], [], s=max(float(packed_marker_size) * 1.5, 40.0), facecolors="none", edgecolors="gold", linewidths=1.0)
+        flash = ax.scatter([], [], s=max(float(packed_marker_size) * 1.8, 60.0), marker="*", c="crimson")
+        view_label = f"{movie.get('site_filter', 'all')} / {projection} packed"
+        is_3d = False
+    else:
+        fig = plt.figure(figsize=(8.4, 8.0))
+        ax = fig.add_subplot(111, projection="3d")
+        mins = plot_positions.min(axis=0)
+        maxs = plot_positions.max(axis=0)
+        center = 0.5 * (mins + maxs)
+        radius = max(0.5 * float(np.max(np.maximum(maxs - mins, 1e-6))) * 1.005, 1e-3)
+        ax.set_xlim(float(center[0] - radius), float(center[0] + radius))
+        ax.set_ylim(float(center[1] - radius), float(center[1] + radius))
+        ax.set_zlim(float(center[2] - radius), float(center[2] + radius))
+        ax.set_box_aspect((1.0, 1.0, 1.0))
+        ax.view_init(elev=22, azim=35)
+        ax.set_xlabel("x (nm)")
+        ax.set_ylabel("y (nm)")
+        ax.set_zlabel("z (nm)")
+        render_positions = np.asarray(plot_positions, dtype=float)
+        render_site_ids = np.asarray(display_site_ids, dtype=np.int32)
+        render_lookup = np.asarray(display_lookup, dtype=np.int32)
+        first_states = np.asarray(frames[0]["states"], dtype=np.int8)[render_site_ids]
+        first_colors, first_sizes = style_site_colors(first_states)
+        base = ax.scatter(
+            render_positions[:, 0],
+            render_positions[:, 1],
+            render_positions[:, 2],
+            c=first_colors,
+            s=first_sizes,
+            depthshade=False,
+            linewidths=0.0,
+        )
+        cluster = ax.scatter([], [], [], s=42, facecolors="none", edgecolors="gold", linewidths=1.0, depthshade=False)
+        flash = ax.scatter([], [], [], s=120, marker="*", c="crimson", depthshade=False)
+        view_label = f"{movie.get('site_filter', 'all')} / {projection}"
+        is_3d = True
 
     state_legend = ax.legend(
         handles=[
@@ -531,35 +819,55 @@ def build_criticality_gif(run_dir: Path, movie: dict[str, Any], output_path: Pat
     )
     ax.add_artist(state_legend)
 
-
-    def set_offsets(scatter: Any, xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> None:
-        scatter._offsets3d = (np.asarray(xs, dtype=float), np.asarray(ys, dtype=float), np.asarray(zs, dtype=float))
+    def set_offsets(scatter: Any, coords: np.ndarray) -> None:
+        coords = np.asarray(coords, dtype=float)
+        if is_3d:
+            if coords.size == 0:
+                scatter._offsets3d = (np.asarray([], dtype=float), np.asarray([], dtype=float), np.asarray([], dtype=float))
+            else:
+                scatter._offsets3d = (coords[:, 0], coords[:, 1], coords[:, 2])
+        else:
+            scatter.set_offsets(coords[:, :2] if coords.size else np.zeros((0, 2), dtype=float))
 
     def update(frame_index: int):
         frame = frames[frame_index]
-        states = np.asarray(frame["states"], dtype=np.int8)
-        colors = state_to_rgba(states)
-        sizes = np.where(build_cluster_active_mask(states), 13.0, 5.8)
+        states = np.asarray(frame["states"], dtype=np.int8)[render_site_ids]
+        colors, sizes = style_site_colors(states, packed=packed_mode, base_size=packed_marker_size)
         base.set_facecolors(colors)
         base.set_edgecolors(colors)
         base.set_sizes(sizes)
-        giant_mask = np.asarray(frame["largest_mask"], dtype=bool)
-        flash_sites = np.asarray(frame["rad_800_sites"], dtype=int)
-        set_offsets(cluster, x[giant_mask], y[giant_mask], z[giant_mask])
-        set_offsets(flash, x[flash_sites], y[flash_sites], z[flash_sites])
+        giant_mask = np.asarray(frame["largest_mask"], dtype=bool)[render_site_ids]
+        flash_sites = render_lookup[np.asarray(frame["rad_800_sites"], dtype=np.int32)]
+        flash_sites = flash_sites[flash_sites >= 0]
+        set_offsets(cluster, render_positions[giant_mask])
+        set_offsets(flash, render_positions[flash_sites])
         event_count = int(movie.get("event_count", 0))
         event_step = int(frame.get("step", 0))
         ax.set_title(
-            f"t = {frame['time']:.3e} s | sampled frame = {frame_index}/{len(frames) - 1} | kMC step = {event_step}/{event_count} | largest cluster = {frame['largest_fraction_all']:.3e}",
-            fontsize=10,
-            pad=12,
+            "\n".join(
+                [
+                    wrap_text_for_plot(str(view_label), width=72),
+                    f"t = {frame['time']:.3e} s | frame {frame_index}/{len(frames) - 1} | kMC step {event_step}/{event_count}",
+                    f"largest active cluster fraction = {frame['largest_fraction_all']:.3e}",
+                ]
+            ),
+            fontsize=9,
+            pad=10,
+            multialignment="center",
         )
         return base, cluster, flash
+
+    if is_3d:
+        fig.subplots_adjust(left=0.02, right=0.98, bottom=0.04, top=0.86)
+    else:
+        fig.subplots_adjust(left=0.10, right=0.97, bottom=0.08, top=0.86)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     anim = animation.FuncAnimation(fig, update, frames=len(frames), blit=False, interval=1000 / max(int(fps), 1))
     anim.save(output_path, writer=animation.PillowWriter(fps=int(fps)), dpi=180)
     plt.close(fig)
+
+
 
 
 def plot_cluster_size_distribution(run_dir: Path, movie: dict[str, Any], output_path: Path) -> dict[str, Any]:
@@ -663,15 +971,20 @@ def plot_cluster_size_distribution(run_dir: Path, movie: dict[str, Any], output_
     ax.tick_params(axis="y", which="minor", length=3.0, width=0.6)
     ax.text(-0.02, -0.08, "0", transform=ax.transAxes, ha="center", va="top", fontsize=11, color="0.25", clip_on=False)
     ax.plot([0.0, 0.0], [0.0, -0.03], transform=ax.transAxes, color="0.45", clip_on=False, lw=0.9)
-    fig.suptitle(
-        f"{run_dir.as_posix()}\nseed={movie['seed']} | aggregated active-cluster size distribution "
-        f"(exact PMF for s < {exact_limit}, log-binned tail for s >= {exact_limit})",
-        fontsize=11,
-        y=0.98,
+    title_lines = set_wrapped_suptitle(
+        fig,
+        "Active-cluster size distribution",
+        [
+            f"Run: {wrap_path_for_plot(run_dir, width=92)}",
+            f"seed={movie['seed']} | exact PMF for s < {exact_limit}; log-binned tail for s >= {exact_limit}",
+        ],
+        width=92,
+        fontsize=10,
+        y=0.985,
     )
-    fig.subplots_adjust(left=0.13, right=0.97, bottom=0.16, top=0.90)
+    fig.subplots_adjust(left=0.13, right=0.97, bottom=0.16, top=axes_top_for_title(title_lines, default_top=0.88))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=220)
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return {
         "output": output_path.as_posix(),
@@ -684,6 +997,82 @@ def plot_cluster_size_distribution(run_dir: Path, movie: dict[str, Any], output_
         "mean_cluster_size": float(np.mean(size_array)),
         "median_cluster_size": float(np.median(size_array)),
     }
+
+
+def plot_n2_trajectory(
+    run_dir: Path,
+    trajectory: dict[str, Any],
+    selected_seed: int,
+    summaries: list[SeedSummary],
+    overlay_all_seeds: bool,
+    output_path: Path,
+    max_points: int,
+    max_markers: int,
+    initial_state_db_path: Path,
+    np_db_path: Path,
+    interactions: dict[int, dict[str, Any]],
+    rad_800_id: int,
+) -> None:
+    fig = plt.figure(figsize=(13.5, 6.3))
+    ax_ts = fig.add_subplot(111)
+    ax_ts2 = ax_ts.twinx()
+
+    if overlay_all_seeds:
+        for summary in summaries:
+            traj = extract_seed_trajectory(initial_state_db_path, np_db_path, interactions, rad_800_id, summary.seed)
+            idx = downsample_indices(len(traj["times"]), max(1000, max_points // 4))
+            ax_ts.plot(
+                np.asarray(traj["times"], dtype=float)[idx],
+                np.asarray(traj["n2"], dtype=float)[idx],
+                color="0.7",
+                alpha=0.15,
+                linewidth=0.8,
+            )
+
+    times = np.asarray(trajectory["times"], dtype=float)
+    n2 = np.asarray(trajectory["n2"], dtype=float)
+    cumulative_800 = np.asarray(trajectory["cumulative_800"], dtype=int)
+    idx = downsample_indices(len(times), max_points)
+    times_ds = times[idx]
+    n2_ds = n2[idx]
+    cumulative_800_ds = cumulative_800[idx]
+
+    ax_ts.plot(times_ds, n2_ds, color="tab:orange", linewidth=1.6, label=r"$n_2$")
+    ax_ts.scatter(times_ds[0], n2_ds[0], color="limegreen", s=40, zorder=4)
+    ax_ts.scatter(times_ds[-1], n2_ds[-1], color="black", s=40, zorder=4)
+    ax_ts.set_title("n2-only population vs time", fontsize=11)
+    ax_ts.set_xlabel("Time (s)")
+    ax_ts.set_ylabel(r"$n_2$ (3F4 fraction)")
+    ax_ts.grid(True, alpha=0.25)
+    ax_ts.set_ylim(bottom=0.0)
+
+    ax_ts2.plot(times_ds, cumulative_800_ds, color="crimson", linewidth=1.4, label="cumulative 800 nm events")
+    ax_ts2.set_ylabel("Cumulative 800 nm events", color="crimson")
+    ax_ts2.tick_params(axis="y", colors="crimson")
+
+    h1, l1 = ax_ts.get_legend_handles_labels()
+    h2, l2 = ax_ts2.get_legend_handles_labels()
+    ax_ts.legend(h1 + h2, l1 + l2, loc="upper left", frameon=False, fontsize=9)
+
+    best = max(summaries, key=lambda item: (item.n4_avg, item.rad_800_count))
+    title_lines = set_wrapped_suptitle(
+        fig,
+        "n2-only trajectory overview",
+        [
+            f"Run: {wrap_path_for_plot(run_dir, width=112)}",
+            (
+                f"selected seed={selected_seed} | n4_avg={trajectory['n4_avg']:.3e} | "
+                f"800 nm events={trajectory['rad_800_count']} | best seed={best.seed} | "
+                f"best n4_avg={best.n4_avg:.3e}"
+            ),
+        ],
+        width=112,
+        fontsize=10,
+        y=0.985,
+    )
+    fig.subplots_adjust(left=0.08, right=0.96, bottom=0.12, top=axes_top_for_title(title_lines, default_top=0.86))
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_trajectory(
@@ -699,7 +1088,25 @@ def plot_trajectory(
     np_db_path: Path,
     interactions: dict[int, dict[str, Any]],
     rad_800_id: int,
+    n2_only: bool = False,
 ) -> None:
+    if n2_only:
+        plot_n2_trajectory(
+            run_dir=run_dir,
+            trajectory=trajectory,
+            selected_seed=selected_seed,
+            summaries=summaries,
+            overlay_all_seeds=overlay_all_seeds,
+            output_path=output_path,
+            max_points=max_points,
+            max_markers=max_markers,
+            initial_state_db_path=initial_state_db_path,
+            np_db_path=np_db_path,
+            interactions=interactions,
+            rad_800_id=rad_800_id,
+        )
+        return
+
     fig = plt.figure(figsize=(16, 7))
     gs = fig.add_gridspec(1, 2, width_ratios=[1.25, 1.0], wspace=0.22)
     ax3d = fig.add_subplot(gs[0, 0], projection="3d")
@@ -767,14 +1174,23 @@ def plot_trajectory(
     ax_ts.legend(h1 + h2, l1 + l2, loc="upper left", frameon=False, fontsize=9)
 
     best = max(summaries, key=lambda item: (item.n4_avg, item.rad_800_count))
-    fig.suptitle(
-        f"{run_dir.as_posix()}\nselected seed={selected_seed}, n4_avg={trajectory['n4_avg']:.3e}, "
-        f"800nm events={trajectory['rad_800_count']}, best seed={best.seed}, best n4_avg={best.n4_avg:.3e}",
-        fontsize=11,
-        y=0.98,
+    title_lines = set_wrapped_suptitle(
+        fig,
+        "n2-n4-n5 trajectory overview",
+        [
+            f"Run: {wrap_path_for_plot(run_dir, width=118)}",
+            (
+                f"selected seed={selected_seed} | n4_avg={trajectory['n4_avg']:.3e} | "
+                f"800 nm events={trajectory['rad_800_count']} | best seed={best.seed} | "
+                f"best n4_avg={best.n4_avg:.3e}"
+            ),
+        ],
+        width=118,
+        fontsize=10,
+        y=0.985,
     )
-    fig.subplots_adjust(left=0.04, right=0.98, bottom=0.08, top=0.84, wspace=0.24)
-    fig.savefig(output_path, dpi=200)
+    fig.subplots_adjust(left=0.04, right=0.98, bottom=0.09, top=axes_top_for_title(title_lines, default_top=0.84), wspace=0.24)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -787,11 +1203,14 @@ def build_summary_json(
     cluster_distribution: dict[str, Any],
     gif_output: Path,
     cluster_output: Path,
+    trajectory_mode: str,
+    gif_projection: str,
 ) -> dict[str, Any]:
     best = max(summaries, key=lambda item: (item.n4_avg, item.rad_800_count))
     return {
         "run_dir": manifest.get("condition_root"),
         "selected_seed": int(selected_seed),
+        "trajectory_mode": str(trajectory_mode),
         "best_seed": int(best.seed),
         "selected_seed_n4_avg": float(trajectory["n4_avg"]),
         "selected_seed_rad_800_count": int(trajectory["rad_800_count"]),
@@ -814,6 +1233,10 @@ def build_summary_json(
             "gif_active_states": [int(v) for v in movie["active_states"]],
             "gif_active_state_label": str(movie["active_state_label"]),
             "gif_cluster_cutoff_nm": float(movie["cluster_cutoff_nm"]),
+            "gif_site_filter": str(movie["site_filter"]),
+            "gif_projection": str(gif_projection),
+            "gif_max_time_s": float(movie["max_time_s"]),
+            "gif_display_site_count": int(movie["display_site_count"]),
             "movie_n4_avg": float(movie["n4_avg"]),
             "movie_rad_800_count": int(movie["rad_800_count"]),
             "movie_peak_active_fraction": float(max(frame["active_fraction"] for frame in movie["frames"])),
@@ -828,6 +1251,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize one kMC trajectory plus criticality outputs.")
     parser.add_argument("run_dir", help="Path to the power run directory.")
     parser.add_argument("--seed", default="auto", help="Integer seed, 'auto', or 'all'.")
+    parser.set_defaults(n2_only=True)
+    parser.add_argument("--n2-only", dest="n2_only", action="store_true", help="Plot only n2 vs time in the overview figure.")
+    parser.add_argument(
+        "--full-trajectory",
+        dest="n2_only",
+        action="store_false",
+        help="Show the older full n2-n4-n5 overview plot.",
+    )
     parser.add_argument("--max-points", type=int, default=DEFAULT_MAX_POINTS)
     parser.add_argument("--max-markers", type=int, default=DEFAULT_MAX_MARKERS)
     parser.add_argument("--output", default=None, help="Output PNG path for the overview plot.")
@@ -836,12 +1267,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gif-frames", type=int, default=DEFAULT_GIF_FRAMES)
     parser.add_argument("--gif-fps", type=int, default=DEFAULT_GIF_FPS)
     parser.add_argument(
+        "--gif-site-filter",
+        choices=("all", "tm-only"),
+        default="tm-only",
+        help="Reduce clutter in the spatial GIF by drawing only the selected site class.",
+    )
+    parser.add_argument(
+        "--gif-projection",
+        choices=("iso", "3d", "xy", "xz", "yz"),
+        default="iso",
+        help="Use iso for a Vesta-like packed render; 3d keeps the old scatter view.",
+    )
+    parser.add_argument(
         "--gif-active-threshold",
         type=int,
         default=None,
         help="Deprecated and ignored. Active cluster sites are fixed to n2+n4+n5.",
     )
     parser.add_argument("--gif-cluster-cutoff-nm", type=float, default=None)
+    parser.add_argument(
+        "--gif-max-time-s",
+        type=float,
+        default=DEFAULT_GIF_MAX_TIME_S,
+        help="Physical time window to include in the GIF. Default: first 0.1 s.",
+    )
     parser.add_argument("--cluster-output", default=None, help="Output PNG path for cluster-size distribution.")
     parser.add_argument("--summary-output", default=None, help="Output JSON summary path.")
     return parser
@@ -857,6 +1306,8 @@ def main() -> None:
     np_db_path = run_dir / "np.sqlite"
     manifest = load_manifest(run_dir)
     interactions, rad_800_id = load_interactions(manifest)
+    global STATE_PALETTE
+    STATE_PALETTE = build_state_palette(infer_state_count(interactions))
 
     selected_seed, summaries = choose_seed(
         initial_state_db_path=initial_state_db_path,
@@ -892,6 +1343,7 @@ def main() -> None:
         np_db_path=np_db_path,
         interactions=interactions,
         rad_800_id=rad_800_id,
+        n2_only=bool(args.n2_only),
     )
 
     movie = build_movie_frames(
@@ -906,8 +1358,16 @@ def main() -> None:
             else float(manifest["geometry"]["interaction_radius_bound_nm"])
         ),
         frame_count=int(args.gif_frames),
+        max_time_s=float(args.gif_max_time_s),
+        site_filter=str(args.gif_site_filter),
     )
-    build_criticality_gif(run_dir=run_dir, movie=movie, output_path=gif_output, fps=int(args.gif_fps))
+    build_criticality_gif(
+        run_dir=run_dir,
+        movie=movie,
+        output_path=gif_output,
+        fps=int(args.gif_fps),
+        projection=str(args.gif_projection),
+    )
     cluster_distribution = plot_cluster_size_distribution(run_dir=run_dir, movie=movie, output_path=cluster_output)
 
     summary = build_summary_json(
@@ -919,6 +1379,8 @@ def main() -> None:
         cluster_distribution=cluster_distribution,
         gif_output=gif_output,
         cluster_output=cluster_output,
+        trajectory_mode="n2-only" if bool(args.n2_only) else "full",
+        gif_projection=str(args.gif_projection),
     )
     summary["movie"]["gif_fps"] = int(args.gif_fps)
     summary_output.parent.mkdir(parents=True, exist_ok=True)

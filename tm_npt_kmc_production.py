@@ -588,6 +588,67 @@ def pair_scale_for_channel(channel_name: str, config: dict[str, Any]) -> float:
     return 1.0
 
 
+def build_npt_raw_vs_npmc_readin(
+    one_site_report: list[dict[str, Any]],
+    two_site_report: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize raw NPT rates beside the final rates written for NPMC."""
+    def one_site_row(row: dict[str, Any]) -> dict[str, Any]:
+        included = bool(row["included"])
+        return {
+            "label": row["label"],
+            "transition": row["transition"],
+            "interaction_type": row["interaction_type"],
+            "species_id": int(row["species_id"]),
+            "species_name": str(row["species_name"]),
+            "npt_raw_rate_s^-1": float(row["base_rate_s^-1"]),
+            "rate_scale_factor": float(row["rate_scale_factor"]),
+            "npmc_readin_rate_s^-1": float(row["rate_s^-1"]) if included else None,
+            "included_in_npmc": included,
+            "filter_reason": row["filter_reason"],
+            "rate_source": row["rate_source"],
+        }
+
+    def two_site_row(row: dict[str, Any]) -> dict[str, Any]:
+        included = bool(row["included"])
+        return {
+            "channel_name": row["channel_name"],
+            "description": row["description"],
+            "species_id_1": int(row.get("species_id_1", TM_SPECIES_ID)),
+            "species_id_2": int(row.get("species_id_2", TM_SPECIES_ID)),
+            "kmc_tuple": row["kmc_tuple"],
+            "npt_raw_rate_constant_nm6_s": float(row["base_kmc_rate"]),
+            "rate_scale_factor": float(row["rate_scale_factor"]),
+            "npmc_readin_rate_constant_nm6_s": (
+                float(row["effective_kmc_rate"]) if included else None
+            ),
+            "included_in_npmc": included,
+            "filter_reason": row["filter_reason"],
+            "npt_raw_dre_equivalent_rate_s^-1": row[
+                "base_dre_equivalent_rate_s^-1"
+            ],
+            "npmc_readin_dre_equivalent_rate_s^-1": (
+                row["effective_dre_equivalent_rate_s^-1"] if included else None
+            ),
+            "rate_source": row["base_rate_source"],
+        }
+
+    return {
+        "one_site_rates": {
+            "units": "s^-1",
+            "left_column": "npt_raw_rate_s^-1",
+            "right_column": "npmc_readin_rate_s^-1",
+            "rows": [one_site_row(row) for row in one_site_report],
+        },
+        "two_site_rate_constants": {
+            "units": "nm^6 s^-1",
+            "left_column": "npt_raw_rate_constant_nm6_s",
+            "right_column": "npmc_readin_rate_constant_nm6_s",
+            "rows": [two_site_row(row) for row in two_site_report],
+        },
+    }
+
+
 def build_custom_interactions(
     params: dict[str, Any],
     source_np_db_path: Path,
@@ -597,6 +658,7 @@ def build_custom_interactions(
     config: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Build one full-NPT interaction network for a single excitation power."""
+    # Source DB provides geometry/species; rates are rebuilt below.
     sim_defaults = params["simulation_defaults"]
     surface_enabled = (
         config["surface_quench_mode"] == "outer_layer"
@@ -610,6 +672,8 @@ def build_custom_interactions(
     )
     site_counts_by_species = rates.count_sites_by_species(source_np_db_path)
     state_to_level = rates.dre_state_to_level_map(params)
+
+    # NPT baseline for this power.
     semi_dopant, semi_sk = rates.build_spectral_kinetics(
         params,
         excitation_power_w_cm2=excitation_power,
@@ -643,6 +707,7 @@ def build_custom_interactions(
     )[tm_slice, tm_slice]
     nr = semi_sk.non_radiative_rate_matrix[tm_slice, tm_slice]
 
+    # One-site radiative rates from NPT.
     for left_state in range(total_rad.shape[0]):
         for right_state in range(total_rad.shape[1]):
             base_rate = float(total_rad[left_state, right_state])
@@ -681,6 +746,7 @@ def build_custom_interactions(
                 )
             )
 
+    # One-site nonradiative rates from NPT; W3NR/W5NR may be scaled.
     for left_state in range(nr.shape[0]):
         for right_state in range(nr.shape[1]):
             base_rate = float(nr[left_state, right_state])
@@ -727,6 +793,7 @@ def build_custom_interactions(
                 )
             )
 
+    # Pump rates from NPT effective sigma times photon flux; ESA may be scaled.
     incident_flux = float(semi_sk.incident_photon_flux)
     pump_rows = [
         {
@@ -782,6 +849,7 @@ def build_custom_interactions(
             )
         )
 
+    # Two-site ET/CR constants exported by NPT; selected channels may be scaled.
     exported_tm_pair_rows = sorted(
         (
             row
@@ -921,6 +989,7 @@ def build_custom_interactions(
             )
         )
 
+    # Optional CR completion using NPT semi-empirical constants.
     if config["npt_cr_mode"] == "all":
         for channel in rates.load_dre_channels(params):
             ordered = rates.order_channel(channel, semi_dopant, state_to_level)
@@ -993,6 +1062,7 @@ def build_custom_interactions(
                 )
             )
 
+    # Optional outer-layer surface quenching.
     if surface_enabled:
         for row in rates.build_surface_one_site_rates(
             semi_sk,
@@ -1096,6 +1166,7 @@ def build_custom_interactions(
                 )
             )
 
+    # Final interaction table for np.sqlite.
     for interaction_id, interaction in enumerate(interactions):
         interaction["interaction_id"] = interaction_id
 
@@ -1124,7 +1195,10 @@ def build_custom_interactions(
             "table_s3_reference": json_safe(table_s3_reference_cross_sections),
             "npt_effective": json_safe(kmc_default_absorption_cross_sections),
         },
-        "mode_defaults": json_safe(config["mode_defaults"]),
+        "npt_raw_vs_npmc_readin": build_npt_raw_vs_npmc_readin(
+            one_site_report,
+            two_site_report,
+        ),
         "geometry": {
             **geometry.__dict__,
             "total_site_count": int(sum(site_counts_by_species.values())),
@@ -2273,7 +2347,7 @@ def main() -> None:
                 if key != "mode_defaults"
             }
         ),
-        "mode_defaults": json_safe(config["mode_defaults"]),
+        "configured_mode_defaults": json_safe(config["mode_defaults"]),
         "powers_w_cm2": [float(power) for power in powers],
         "dry_run": bool(args.dry_run),
         "num_sims": int(args.num_sims),

@@ -20,17 +20,17 @@ set -euo pipefail
 # will run up to floor(80 / 8) = 10 powers concurrently.
 
 python -B "./tm_npt_kmc_production.py" \
-  --core-radius-a 130 \
+  --core-radius-a 50 \
   --surface-quench-mode outer_layer \
   --shell-thickness-a 25 \
-  --tm-fraction 0.0456 \
+  --tm-fraction 0.08 \
   --npt-cr-mode exported \
-  --sigma-esa-scale 400 \
+  --sigma-esa-scale 200 \
   --s12-scale 30 \
   --power-sampling-mode centered-gaussian \
   --power-center 10000 \
   --power-min 3000 \
-  --power-max 30000 \
+  --power-max 50000 \
   --power-count 12 \
   --num-sims 8 \
   --thread-count 8 \
@@ -40,7 +40,8 @@ python -B "./tm_npt_kmc_production.py" \
   --fixed-W3_NR-scale 1 \
   --fixed-W5_NR-scale 1 \
   --em-mode all \
-  --em-scale 0.01 \
-  --simulation-length 10000000
+  --em-scale 1.0 \
+  --simulation-length 10000000 \
+  --output-root r50-8p0-EM1p0
 #  --cutoff-mode physical-time \
 #  --simulation-time 1.0

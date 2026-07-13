@@ -149,11 +149,11 @@
   "production_defaults": {
     "npt": {
       "npt_cr_mode": "all",
-      "sigma_esa_scale": 1185.7978647623052,
+      "sigma_esa_scale": 200.0,
       "q21_scale": 1.0,
       "s54_scale": 1.0,
       "s45_scale": 1.0,
-      "s12_scale": 21.148836746821555,
+      "s12_scale": 30.0,
       "w3_nr_scale": 1.0,
       "w5_nr_scale": 1.0,
       "em_mode": "off",

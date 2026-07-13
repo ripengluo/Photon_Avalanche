@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -34,7 +33,6 @@ from matplotlib.ticker import FixedLocator, FuncFormatter
 from scipy.spatial import cKDTree
 
 from tm_npt_kmc_trajectory_3d import (
-    RAD_800_LABEL,
     iter_trajectory_rows,
     load_interactions,
     load_manifest,
