@@ -649,6 +649,36 @@ def build_npt_raw_vs_npmc_readin(
     }
 
 
+def load_manifest_raw_vs_npmc_readin(manifest_path: str | Path) -> dict[str, Any]:
+    """Load or reconstruct the raw-NPT vs NPMC-readin table from a manifest."""
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
+    if "npt_raw_vs_npmc_readin" in manifest:
+        return manifest["npt_raw_vs_npmc_readin"]
+    return build_npt_raw_vs_npmc_readin(
+        manifest["one_site"],
+        manifest["two_site"],
+    )
+
+
+def build_power_rate_tables(build_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect per-power raw-NPT vs NPMC-readin rate tables for the root config."""
+    tables = []
+    for record in sorted(build_records, key=lambda row: int(row["power_index"])):
+        manifest_path = Path(record["manifest_path"])
+        tables.append(
+            {
+                "power_index": int(record["power_index"]),
+                "excitation_power_w_cm2": float(record["excitation_power_w_cm2"]),
+                "manifest_path": str(manifest_path.resolve()),
+                "npt_raw_vs_npmc_readin": load_manifest_raw_vs_npmc_readin(
+                    manifest_path
+                ),
+            }
+        )
+    return tables
+
+
 def build_custom_interactions(
     params: dict[str, Any],
     source_np_db_path: Path,
@@ -2347,7 +2377,6 @@ def main() -> None:
                 if key != "mode_defaults"
             }
         ),
-        "configured_mode_defaults": json_safe(config["mode_defaults"]),
         "powers_w_cm2": [float(power) for power in powers],
         "dry_run": bool(args.dry_run),
         "num_sims": int(args.num_sims),
@@ -2436,6 +2465,11 @@ def main() -> None:
                 summaries.append(summary)
 
     build_records.sort(key=lambda row: int(row["power_index"]))
+    root_config["npt_raw_vs_npmc_readin_by_power"] = build_power_rate_tables(
+        build_records
+    )
+    with open(output_root / "npt_production_config.json", "w") as f:
+        json.dump(json_safe(root_config), f, indent=2)
 
     max_local_log_slope_800 = None
     max_local_log_slope_800_power_w_cm2 = None
