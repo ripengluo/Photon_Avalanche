@@ -32,7 +32,7 @@ from NanoParticleTools.inputs.util import get_all_interactions  # noqa: E402
 from NanoParticleTools.species_data.species import Dopant  # noqa: E402
 
 
-DEFAULT_PARAMS_PATH = ROOT / "table_s3_4p5_0nN.json"
+DEFAULT_PARAMS_PATH = ROOT / "SK_input.json"
 
 
 @dataclass(frozen=True)
@@ -92,10 +92,15 @@ class SpeciesRecord:
     degrees_of_freedom: int
 
 
-def load_dre_parameters(path: str | Path = DEFAULT_PARAMS_PATH) -> dict[str, Any]:
+def load_sk_parameters(path: str | Path = DEFAULT_PARAMS_PATH) -> dict[str, Any]:
     """Load the JSON parameter/profile file."""
     with open(path) as f:
         return json.load(f)
+
+
+def load_dre_parameters(path: str | Path = DEFAULT_PARAMS_PATH) -> dict[str, Any]:
+    """Backward-compatible alias for older production entrypoints."""
+    return load_sk_parameters(path)
 
 
 def dre_state_to_level_map(params: dict[str, Any]) -> dict[int, int]:
@@ -327,7 +332,7 @@ def build_kmc_default_absorption_cross_sections(
 
     return {
         "sigma_GSA": effective_sigma(0, 2),
-        "sigma_ESA": effective_sigma(1, 4),
+        "sigma_ESA": effective_sigma(1, 5),
     }
 
 
