@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH -p cm1 -A pc_lnpmc -q cm1_normal
-#SBATCH -N 1 -t 48:00:00 -n 48 -c 1 --mem=192G
+#SBATCH -N 1 -t 72:00:00 -n 48 -c 1 --mem=192G
 #SBATCH -J kmc_npt12_adaptive
 
 set -euo pipefail
@@ -30,3 +30,4 @@ python -B "./tm_npt_kmc_production.py" \
   --checkpoint-extension-steps 5000000 \
   --max-step-cutoff 50000000 \
   --output-root r50-8p0-EM1-adaptive
+  --power-parallel-total-slots 24

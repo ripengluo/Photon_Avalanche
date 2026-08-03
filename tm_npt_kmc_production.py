@@ -3783,13 +3783,25 @@ def load_json_file(path: Path) -> Any | None:
         return json.load(handle)
 
 
+def resolve_power_parallel_total_slots(args: argparse.Namespace) -> int | None:
+    """Effective CPU-slot budget for power-parallel scheduling.
+
+    A SLURM allocation always wins over --power-parallel-total-slots: the
+    scheduler, not the CLI flag, knows the real CPU budget on a cluster node.
+    """
+    if (
+        os.environ.get("SLURM_NTASKS") is not None
+        or os.environ.get("SLURM_CPUS_ON_NODE") is not None
+    ):
+        return default_power_parallel_total_slots()
+    if args.power_parallel_total_slots is not None:
+        return int(args.power_parallel_total_slots)
+    return default_power_parallel_total_slots()
+
+
 def resolve_power_parallel_workers(args: argparse.Namespace, n_jobs: int) -> int:
     """Worker count for concurrent power points (same rule as single-stage)."""
-    total_slots = (
-        int(args.power_parallel_total_slots)
-        if args.power_parallel_total_slots is not None
-        else default_power_parallel_total_slots()
-    )
+    total_slots = resolve_power_parallel_total_slots(args)
     if args.power_parallel_workers is not None:
         workers = max(1, int(args.power_parallel_workers))
     elif total_slots is not None:
@@ -5479,7 +5491,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--power-parallel-total-slots",
         type=int,
-        default=24,
+        default=None,
         help=(
             "Total CPU slots available for the power-parallel scheduler. Defaults "
             "to Slurm environment variables when present."
@@ -5740,6 +5752,7 @@ def main() -> None:
     build_records: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
     power_parallel_workers = resolve_power_parallel_workers(args, len(powers))
+    power_parallel_total_slots = resolve_power_parallel_total_slots(args)
     auto_power_parallel = power_parallel_workers > 1
     local_db_staging_root = (
         None if args.dry_run else resolve_local_db_staging_root()
