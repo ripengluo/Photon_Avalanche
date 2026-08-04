@@ -21,6 +21,7 @@ from matplotlib import pyplot as plt
 from matplotlib.ticker import FixedLocator, FuncFormatter
 
 import tm_npt_rates as rates
+import plot_mechanism_diagrams
 from NanoParticleTools.core import NPMCInput
 from NanoParticleTools.analysis.util import get_spectrum_wavelength_from_dndt
 from NanoParticleTools.inputs.nanoparticle import DopedNanoparticle, SphericalConstraint
@@ -75,7 +76,6 @@ FALLBACK_PRODUCTION_DEFAULTS = {
     "s54_scale": 1.0,
     "s45_scale": 1.0,
     "s12_scale": 1.0,
-    "beta_s12_cm": 0.003,
     "em_mode": "off",
     "em_scale": 1.0,
     "surface_quench_mode": DEFAULT_SURFACE_QUENCH_MODE,
@@ -182,15 +182,6 @@ def resolve_simulation_cutoff(
         step_cutoff = int(args.simulation_length)
         if step_cutoff <= 0:
             raise ValueError("--simulation-length must be positive")
-        if args.max_simulation_length is not None:
-            max_step_cutoff = int(args.max_simulation_length)
-            if max_step_cutoff <= 0:
-                raise ValueError("--max-simulation-length must be positive")
-            if max_step_cutoff < step_cutoff:
-                raise ValueError(
-                    "--max-simulation-length must be greater than or equal to "
-                    "--simulation-length"
-                )
         return mode, step_cutoff, None
 
     if args.simulation_time is None:
@@ -200,50 +191,14 @@ def resolve_simulation_cutoff(
     time_cutoff = float(args.simulation_time)
     if time_cutoff <= 0:
         raise ValueError("--simulation-time must be positive")
-    if args.max_simulation_length is not None:
-        raise ValueError(
-            "--max-simulation-length only applies to step cutoff mode, not "
-            "physical-time mode"
-        )
     return mode, None, time_cutoff
 
 
-def resolve_simulation_length_mode(args: argparse.Namespace) -> str:
-    """Resolve the per-power step-cutoff scheduler."""
-    if args.resolved_cutoff_mode != "steps":
-        return "homogeneous"
-    if args.simulation_length_mode is not None:
-        return str(args.simulation_length_mode)
-    return "centered-gaussian" if args.max_simulation_length is not None else "homogeneous"
-
-
-def simulation_step_cutoff_for_power(args: argparse.Namespace, power: float) -> int | None:
-    """Return the per-power step cutoff for the configured length scheduler."""
+def simulation_step_cutoff_for_power(args: argparse.Namespace) -> int | None:
+    """Return the uniform per-seed step cutoff for the configured cutoff mode."""
     if args.resolved_cutoff_mode != "steps":
         return None
-    floor_length = int(args.resolved_simulation_length)
-    if args.resolved_simulation_length_mode == "homogeneous":
-        return floor_length
-
-    max_length = (
-        floor_length
-        if args.max_simulation_length is None
-        else int(args.max_simulation_length)
-    )
-    if max_length == floor_length:
-        return floor_length
-
-    if power <= 0 or args.power_center <= 0:
-        raise ValueError("Power and --power-center must be positive")
-    if args.power_gaussian_sigma_decades <= 0:
-        raise ValueError("--power-gaussian-sigma-decades must be positive")
-
-    distance = (
-        np.log10(float(power)) - np.log10(float(args.power_center))
-    ) / float(args.power_gaussian_sigma_decades)
-    weight = float(np.exp(-0.5 * distance**2))
-    step_cutoff = int(round(floor_length + (max_length - floor_length) * weight))
-    return max(floor_length, min(max_length, step_cutoff))
+    return int(args.resolved_simulation_length)
 
 
 def next_run_dir(parent: Path = SCRIPT_DIR) -> Path:
@@ -600,7 +555,6 @@ def resolve_production_config(
         "s54_scale": float(choose("s54_scale", args.s54_scale)),
         "s45_scale": float(choose("s45_scale", args.s45_scale)),
         "s12_scale": float(choose("s12_scale", args.s12_scale)),
-        "beta_s12_cm": float(choose("beta_s12_cm", args.beta_s12)),
         "em_mode": str(choose("em_mode", args.em_mode)),
         "em_scale": float(choose("em_scale", args.em_scale)),
         "surface_quench_mode": str(
@@ -621,8 +575,6 @@ def resolve_production_config(
         )
     if not (0.0 <= config["surface_fraction"] <= 1.0):
         raise ValueError("surface_fraction must lie between 0 and 1")
-    if config["beta_s12_cm"] < 0.0:
-        raise ValueError("beta_s12 must be non-negative")
     return config
 
 
@@ -637,45 +589,6 @@ def pair_scale_for_channel(channel_name: str, config: dict[str, Any]) -> float:
     if channel_name == S12_CHANNEL_NAME:
         return float(config["s12_scale"])
     return 1.0
-
-
-def s12_beta_correction_metadata(
-    local_tuple: tuple[int, int, int, int],
-    dopant: Any,
-    sk: Any,
-    config: dict[str, Any],
-) -> dict[str, float | str] | None:
-    """Return the Stark/phonon-sideband beta correction for s12,42."""
-    if local_tuple != (3, 1, 0, 1):
-        return None
-
-    donor_initial, donor_final, acceptor_initial, acceptor_final = local_tuple
-    donor_energy_change = (
-        dopant.energy_levels[donor_final].energy
-        - dopant.energy_levels[donor_initial].energy
-    )
-    acceptor_energy_change = (
-        dopant.energy_levels[acceptor_final].energy
-        - dopant.energy_levels[acceptor_initial].energy
-    )
-    energy_gap = float(donor_energy_change + acceptor_energy_change)
-    effective_energy_gap = float(energy_gap + sk.stokes_shift)
-    npt_mpr_beta = float(sk.mpr_beta)
-    beta_s12 = float(config["beta_s12_cm"])
-    correction_factor = float(
-        np.exp((npt_mpr_beta - beta_s12) * abs(effective_energy_gap))
-    )
-    return {
-        "beta_correction_channel": S12_CHANNEL_NAME,
-        "beta_correction_model": (
-            "Stark- and phonon-sideband-resolved overlap surrogate"
-        ),
-        "npt_mpr_beta_cm": npt_mpr_beta,
-        "beta_s12_cm": beta_s12,
-        "energy_gap_cm": energy_gap,
-        "effective_energy_gap_cm": effective_energy_gap,
-        "beta_correction_factor": correction_factor,
-    }
 
 
 def build_npt_raw_vs_npmc_readin(
@@ -721,7 +634,6 @@ def build_npt_raw_vs_npmc_readin(
                 row["effective_dre_equivalent_rate_s^-1"] if included else None
             ),
             "rate_source": row["base_rate_source"],
-            "beta_correction": row.get("beta_correction"),
         }
 
     return {
@@ -1055,21 +967,7 @@ def build_custom_interactions(
                 "enabled_modes": migration["enabled_modes"],
             }
         else:
-            beta_metadata = s12_beta_correction_metadata(
-                kmc_tuple,
-                semi_dopant,
-                semi_sk,
-                config,
-            )
-            beta_correction_factor = (
-                1.0
-                if beta_metadata is None
-                else float(beta_metadata["beta_correction_factor"])
-            )
-            rate_scale_factor = (
-                float(pair_scale_for_channel(channel_name, config))
-                * beta_correction_factor
-            )
+            rate_scale_factor = float(pair_scale_for_channel(channel_name, config))
             effective_rate = base_rate * rate_scale_factor
             effective_dre_equivalent = (
                 base_dre_equivalent * rate_scale_factor
@@ -1102,7 +1000,6 @@ def build_custom_interactions(
                 "filter_reason": filter_reason,
                 "source": base_rate_source_label,
                 "is_resonant_migration": False,
-                "beta_correction": beta_metadata,
             }
         two_site_report.append(report)
         if not included:
@@ -1146,14 +1043,6 @@ def build_custom_interactions(
                 / geometry.ion_count
             )
             rate_scale_factor = float(pair_scale_for_channel(channel.name, config))
-            beta_metadata = s12_beta_correction_metadata(
-                kmc_tuple,
-                semi_dopant,
-                semi_sk,
-                config,
-            )
-            if beta_metadata is not None:
-                rate_scale_factor *= float(beta_metadata["beta_correction_factor"])
             effective_rate = base_rate * rate_scale_factor
             effective_dre_equivalent = base_dre_equivalent * rate_scale_factor
             included = include_zero_rates or effective_rate != 0.0
@@ -1184,7 +1073,6 @@ def build_custom_interactions(
                 "filter_reason": filter_reason,
                 "source": "NPT semi-empirical selected",
                 "is_resonant_migration": False,
-                "beta_correction": beta_metadata,
             }
             two_site_report.append(report)
             if not included:
@@ -1332,7 +1220,6 @@ def build_custom_interactions(
         "s54_scale": float(config["s54_scale"]),
         "s45_scale": float(config["s45_scale"]),
         "s12_scale": float(config["s12_scale"]),
-        "beta_s12_cm": float(config["beta_s12_cm"]),
         "absorption_cross_sections_cm^2": {
             "npt_effective": json_safe(kmc_default_absorption_cross_sections),
         },
@@ -1592,7 +1479,7 @@ def run_power_point(
             flush=True,
         )
     simulation_cutoff_mode = str(args.resolved_cutoff_mode)
-    simulation_step_cutoff = simulation_step_cutoff_for_power(args, float(power))
+    simulation_step_cutoff = simulation_step_cutoff_for_power(args)
     simulation_time_cutoff_s = args.resolved_simulation_time
     cutoff_label = (
         f"{simulation_step_cutoff} steps"
@@ -1617,15 +1504,6 @@ def run_power_point(
     )
     manifest["simulation_time_cutoff_s"] = (
         None if simulation_time_cutoff_s is None else float(simulation_time_cutoff_s)
-    )
-    manifest["simulation_length_mode"] = str(args.resolved_simulation_length_mode)
-    manifest["simulation_length_floor"] = (
-        None
-        if args.resolved_simulation_length is None
-        else int(args.resolved_simulation_length)
-    )
-    manifest["max_simulation_length"] = (
-        None if args.max_simulation_length is None else int(args.max_simulation_length)
     )
     np_db_path, initial_state_db_path = write_custom_npmc_databases(
         source_np_db_path=source_np_db_path,
@@ -1691,6 +1569,14 @@ def run_power_point(
         summary=summary,
         interactions=interactions,
         output_dir=output_dir,
+    )
+    plot_mechanism_diagrams.plot_run(
+        output_dir,
+        output_name="mechanism_diagram.png",
+        rate_key="events_per_ion_s",
+        min_rate=1e-3,
+        max_by_kind={"ET": 16, "Rad": 18, "NR": 12, "Pump": 8, "SQ": 16},
+        dpi=220,
     )
 
     move_output_file(np_db_path, output_dir / "np.sqlite")
@@ -2113,7 +1999,6 @@ def summarize_run(
         "s54_scale": float(manifest["s54_scale"]),
         "s45_scale": float(manifest["s45_scale"]),
         "s12_scale": float(manifest["s12_scale"]),
-        "beta_s12_cm": float(manifest["beta_s12_cm"]),
         "em_mode": str(manifest["em_mode"]),
         "em_scale": float(manifest["em_scale"]),
         "surface_quench_mode": str(manifest["surface_quench_mode"]),
@@ -2429,19 +2314,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--s12-scale",
         type=float,
         default=None,
-        help=(
-            "Residual multiplicative factor for s12,42 after the beta_s12 "
-            "correction. Defaults come from the parameter JSON."
-        ),
-    )
-    parser.add_argument(
-        "--beta-s12",
-        type=float,
-        default=None,
-        help=(
-            "Channel-specific multiphonon beta in cm for s12,42. This replaces "
-            "the old empirical boost with a Stark/phonon-sideband overlap surrogate."
-        ),
+        help="Fixed multiplicative factor for s12,42.",
     )
     parser.add_argument(
         "--em-mode",
@@ -2542,29 +2415,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--simulation-length",
         type=int,
         default=DEFAULT_SIMULATION_LENGTH,
-        help=(
-            "Per-seed event cutoff used when cutoff mode is 'steps'. With "
-            "--max-simulation-length, this becomes the damped floor length."
-        ),
-    )
-    parser.add_argument(
-        "--max-simulation-length",
-        type=int,
-        default=None,
-        help=(
-            "Maximum per-seed event cutoff for centered powers. When set, "
-            "per-power step cutoffs are damped from this value toward "
-            "--simulation-length at the power-range limits."
-        ),
-    )
-    parser.add_argument(
-        "--simulation-length-mode",
-        choices=("homogeneous", "centered-gaussian"),
-        default=None,
-        help=(
-            "Per-power step cutoff scheduler. Defaults to homogeneous unless "
-            "--max-simulation-length is set, then centered-gaussian."
-        ),
+        help="Per-seed event cutoff used when cutoff mode is 'steps'.",
     )
     parser.add_argument(
         "--simulation-time",
@@ -2602,7 +2453,6 @@ def main() -> None:
         args.resolved_simulation_length,
         args.resolved_simulation_time,
     ) = resolve_simulation_cutoff(args)
-    args.resolved_simulation_length_mode = resolve_simulation_length_mode(args)
     params = rates.load_sk_parameters(args.params)
     config = resolve_production_config(args, params)
     output_root = Path(args.output_root) if args.output_root else next_run_dir()
@@ -2656,10 +2506,7 @@ def main() -> None:
         "simulation_step_cutoffs_by_power": [
             {
                 "power_w_cm2": float(power),
-                "simulation_step_cutoff": simulation_step_cutoff_for_power(
-                    args,
-                    float(power),
-                ),
+                "simulation_step_cutoff": simulation_step_cutoff_for_power(args),
             }
             for power in powers
         ],
@@ -2681,18 +2528,10 @@ def main() -> None:
         ),
         "trajectory_archive_root": str(trajectory_archive_root.resolve()),
         "simulation_cutoff_mode": args.resolved_cutoff_mode,
-        "simulation_length_mode": str(args.resolved_simulation_length_mode),
         "simulation_step_cutoff": (
             None
             if args.resolved_simulation_length is None
             else int(args.resolved_simulation_length)
-        ),
-        "max_simulation_length": (
-            None if args.max_simulation_length is None else int(args.max_simulation_length)
-        ),
-        "power_center_for_simulation_length": float(args.power_center),
-        "power_gaussian_sigma_decades_for_simulation_length": float(
-            args.power_gaussian_sigma_decades
         ),
         "simulation_time_cutoff_s": (
             None

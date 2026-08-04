@@ -58,7 +58,6 @@ python tm_npt_kmc_production.py \
   --npmc-command /path/to/NPMC \
   --npt-cr-mode exported \
   --sigma-esa-scale 1.0 \
-  --beta-s12 0.0023 \
   --s12-scale 1 \
   --power-sampling-mode centered-gaussian \
   --power-center 1.1e4 \
@@ -66,7 +65,6 @@ python tm_npt_kmc_production.py \
   --power-max 3.0e4 \
   --power-count 20 \
   --simulation-length 2000000 \
-  --max-simulation-length 10000000 \
   --num-sims 8 \
   --thread-count 8
 ```
@@ -75,9 +73,9 @@ Use `--dry-run` first if you only want the databases and manifests.
 
 Production sweeps always use the NanoParticleTools rate model. The main knobs
 for matching prior behavior are the fixed empirical scales such as
-`--sigma-esa-scale`, residual `--s12-scale`, and `--em-scale`.
+`--sigma-esa-scale`, `--s12-scale`, and `--em-scale`.
 
-### s12,42 cross-relaxation correction
+### s12,42 cross-relaxation scaling
 
 The PA-loop cross relaxation
 
@@ -85,53 +83,10 @@ The PA-loop cross relaxation
 3H4 + 3H6 -> 3F4 + 3F4
 ```
 
-is labeled `s12,42` in the production manifests. The default correction is now
-`--beta-s12 0.0023`, stored as `beta_s12_cm` in `SK_input.json`. This replaces
-the previous baseline use of `--s12-scale 30` with a channel-specific
-multiphonon beta for this one CR path; `--s12-scale` remains available as a
-residual multiplier and defaults to `1`.
-
-The physical interpretation is a Stark- and phonon-sideband-resolved overlap
-between the donor emission and acceptor absorption bands:
-
-```text
-J_s12 = sum_{i,j,k,l,m} p_i |V_{ijkl}|^2 S_m
-        integral E_3H4_i->3F4_k(lambda)
-                 A_3H6_j->3F4_l(lambda - m hbar omega_ph) d lambda
-```
-
-where `E_3H4->3F4` is the donor emission line shape,
-`A_3H6->3F4` is the acceptor absorption line shape, `p_i` is the thermal
-population of the donor Stark sublevel, and `S_m` weights the `m`-phonon
-sideband. In the current reduced NPT workflow this detailed overlap is
-represented by
-
-```text
-K_s12(corrected) = K_s12(NPT) exp[(mpr_beta - beta_s12) |Delta_eff|]
-```
-
-with `Delta_eff` computed from the NPT multiplet energies plus the configured
-Stokes shift. The default `beta_s12 = 0.0023 cm` is therefore a spectral-overlap
-surrogate for the `3H4 -> 3F4` / `3H6 -> 3F4` CR pair, not a global MPR change.
-
-### Inhomogeneous simulation length
-
-Step-cutoff runs can assign longer trajectories near the PA build-up region and
-shorter trajectories at the low/high power limits. Set `--max-simulation-length`
-to enable the centered-Gaussian scheduler. In this mode `--simulation-length`
-is the floor and `--max-simulation-length` is the central value:
-
-```text
-L(P) = L_floor + (L_max - L_floor)
-       exp[-0.5 ((log10(P) - log10(P_center)) / sigma_decades)^2]
-```
-
-`P_center` and `sigma_decades` reuse `--power-center` and
-`--power-gaussian-sigma-decades`, so the length profile follows the same center
-as `--power-sampling-mode centered-gaussian`. If `--max-simulation-length` is
-omitted, all powers use the homogeneous `--simulation-length` cutoff. The exact
-per-power cutoffs are written to `npt_production_config.json` and each power
-manifest.
+is labeled `s12,42` in the production manifests. Its NPT rate is scaled by the
+fixed multiplicative factor `--s12-scale`, stored as `s12_scale` in
+`SK_input.json` and defaulting to `1`. No channel-specific beta correction is
+applied to this CR path.
 
 The helper script `simulate_kmc_production.sh` is a convenience wrapper, but
 the `NPMC` path in `tm_npt_kmc_production.py` may need to be updated for

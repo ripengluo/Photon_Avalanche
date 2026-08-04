@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH -p cm1 -A pc_lnpmc -q cm1_normal
-#SBATCH -N 1 -t 48:00:00 -n 48 -c 1 --mem=192G
+#SBATCH -N 1 -t 72:00:00 -n 48 -c 1 --mem=192G
 #SBATCH -J kmc_npt12_parallel
 
 set -euo pipefail
@@ -10,11 +10,11 @@ set -euo pipefail
 # - 2.5 nm shell (shell thickness 25 A)
 # - NPT exported CR rows
 # - sigma_esa_scale = 1
-# - beta_s12 = 0.003 cm, residual s12_scale = 1
+# - s12_scale = 1 (no beta_s12 correction)
 # - q21/s54/s45 unchanged
 # - EM enabled with em_scale = 1.0
 # - outer-layer surface quenching enabled
-# - centered powers run up to 10M steps; power-range limits damp to 2M steps
+# - uniform step cutoff: every power runs the same 5M steps
 #
 # Power parallelism is handled automatically inside tm_npt_kmc_production.py.
 # With the current Slurm allocation (-n 48) and --thread-count 8, the script
@@ -27,7 +27,6 @@ python -B "./tm_npt_kmc_production.py" \
   --tm-fraction 0.08 \
   --npt-cr-mode exported \
   --sigma-esa-scale 1.0 \
-  --beta-s12 0.003 \
   --s12-scale 1 \
   --power-sampling-mode centered-gaussian \
   --power-center 10000 \
@@ -36,13 +35,10 @@ python -B "./tm_npt_kmc_production.py" \
   --power-count 12 \
   --num-sims 8 \
   --thread-count 8 \
-  --q21-scale 1 \
-  --s54-scale 1 \
-  --s45-scale 1 \
   --em-mode all \
   --em-scale 1.0 \
-  --simulation-length 5000000 \
-  --max-simulation-length 30000000 \
+  --simulation-length 50000000 \
   --output-root r50-8p0-EM1p0
+  --power-parallel-total-slots 24
 #  --cutoff-mode physical-time \
 #  --simulation-time 1.0

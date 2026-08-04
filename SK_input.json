@@ -23,7 +23,6 @@
       "s54_scale": 1.0,
       "s45_scale": 1.0,
       "s12_scale": 1.0,
-      "beta_s12_cm": 0.003,
       "em_mode": "off",
       "em_scale": 1.0,
       "surface_quench_mode": "off",
