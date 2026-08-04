@@ -29,7 +29,8 @@ python -B "./tm_npt_kmc_production.py" \
   --sigma-esa-scale 1.0 \
   --s12-scale 1 \
   --power-sampling-mode centered-gaussian \
-  --power-center 10000 \
+  --power-gaussian-sigma-decades 0.05
+  --power-center 13000 \
   --power-min 3000 \
   --power-max 50000 \
   --power-count 12 \
@@ -38,7 +39,7 @@ python -B "./tm_npt_kmc_production.py" \
   --em-mode all \
   --em-scale 1.0 \
   --simulation-length 50000000 \
-  --output-root r50-8p0-EM1p0
+  --output-root r50-8p0-baseline \
   --power-parallel-total-slots 24
 #  --cutoff-mode physical-time \
 #  --simulation-time 1.0

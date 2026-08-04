@@ -36,7 +36,7 @@ DEFAULT_POWER_COUNT = 8
 DEFAULT_SIMULATION_LENGTH = 2000000
 DEFAULT_POWER_SAMPLING_MODE = "homogeneous"
 DEFAULT_POWER_GAUSSIAN_CENTER = 1.0e4
-DEFAULT_POWER_GAUSSIAN_SIGMA_DECADES = 0.18
+DEFAULT_POWER_GAUSSIAN_SIGMA_DECADES = 0.10
 DEFAULT_TRAJECTORY_ARCHIVE_ROOT = Path(
     "/home/rpluo/Desktop/hdd_large/KMC_trajectories/Tm_4p5-NPT"
 )
@@ -2544,7 +2544,9 @@ def main() -> None:
 
     power_jobs = [
         (int(power_index), float(power))
-        for power_index, power in enumerate(powers)
+        for power_index, power in sorted(
+            enumerate(powers), key=lambda item: item[1], reverse=True
+        )
     ]
     if auto_power_parallel:
         print(
