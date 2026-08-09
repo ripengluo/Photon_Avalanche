@@ -16,12 +16,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+# Matplotlib requires a writable cache directory; default locations can be
+# read-only on HPC filesystems, so force a writable tmpfs path before importing
+# any matplotlib submodules that rely on it (e.g., mathtext font caching).
+_mpl_cache_dir = Path("/dev/shm") / "matplotlib-cache"
+_mpl_cache_dir.mkdir(parents=True, exist_ok=True)
+os.environ["MPLCONFIGDIR"] = str(_mpl_cache_dir)
+
 import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.ticker import FixedLocator, FuncFormatter
 
 import tm_npt_rates as rates
 import plot_mechanism_diagrams
+from convergence_diagnostic import (
+    replay_trajectories,
+    TM_SPECIES_ID,
+    N4_LEVEL,
+    Q21_CHANNEL_NAME,
+    S12_CHANNEL_NAME,
+)
 from NanoParticleTools.core import NPMCInput
 from NanoParticleTools.analysis.util import get_spectrum_wavelength_from_dndt
 from NanoParticleTools.inputs.nanoparticle import DopedNanoparticle, SphericalConstraint
@@ -45,14 +59,9 @@ SURFACE_LAYER_THICKNESS_A = SURFACE_LAYER_THICKNESS_NM * 10
 DEFAULT_SURFACE_QUENCH_MODE = "off"
 DEFAULT_SURFACE_SPECIES = "Surface"
 DEFAULT_SURFACE_FRACTION = 0.20
-TM_SPECIES_ID = 0
 SURFACE_SPECIES_ID = 1
-
-Q21_CHANNEL_NAME = "Q21,24"
-S12_CHANNEL_NAME = "s12,42"
 S54_CHANNEL_NAME = "s54,23"
 S45_CHANNEL_NAME = "s45,32"
-N4_LEVEL = 3
 TM_CHANNEL_TUPLE_TO_NAME = {
     (3, 1, 0, 1): S12_CHANNEL_NAME,
     (1, 0, 1, 3): Q21_CHANNEL_NAME,
@@ -195,7 +204,11 @@ def resolve_simulation_cutoff(
 
 
 def simulation_step_cutoff_for_power(args: argparse.Namespace) -> int | None:
-    """Return the uniform per-seed step cutoff for the configured cutoff mode."""
+    """Return the per-seed step length requested by the user.
+
+    For a fresh run this is the total cutoff. For a resume run it is the
+    extension length to add to the previous cutoff.
+    """
     if args.resolved_cutoff_mode != "steps":
         return None
     return int(args.resolved_simulation_length)
@@ -1479,17 +1492,11 @@ def run_power_point(
             flush=True,
         )
     simulation_cutoff_mode = str(args.resolved_cutoff_mode)
-    simulation_step_cutoff = simulation_step_cutoff_for_power(args)
-    simulation_time_cutoff_s = args.resolved_simulation_time
-    cutoff_label = (
-        f"{simulation_step_cutoff} steps"
-        if simulation_cutoff_mode == "steps"
-        else f"{simulation_time_cutoff_s} s"
-    )
-    print(
-        f"[power {power_index + 1}/{power_count}] simulation cutoff: {cutoff_label}",
-        flush=True,
-    )
+    # User-specified length: total cutoff for fresh runs, extension length for resumes.
+    base_simulation_step_cutoff = simulation_step_cutoff_for_power(args)
+    base_simulation_time_cutoff_s = args.resolved_simulation_time
+    simulation_step_cutoff = base_simulation_step_cutoff
+    simulation_time_cutoff_s = base_simulation_time_cutoff_s
     interactions, manifest = build_custom_interactions(
         params=params,
         source_np_db_path=source_np_db_path,
@@ -1499,23 +1506,87 @@ def run_power_point(
         config=config,
     )
     manifest["simulation_cutoff_mode"] = simulation_cutoff_mode
+    final_np_db_path = output_dir / "np.sqlite"
+    final_initial_state_db_path = output_dir / "initial_state.sqlite"
+
+    # --resume means: extend an existing run by the user-specified length.
+    # The previous cutoff is read from the existing npt_run_summary.json and the
+    # new cutoff becomes previous + extension. This is not a shortcut for
+    # re-summarizing finished runs or creating new points.
+    if bool(args.resume):
+        if not final_np_db_path.exists() or not final_initial_state_db_path.exists():
+            raise FileNotFoundError(
+                f"[power {power_index + 1}/{power_count}] resume requested but "
+                f"required databases are missing in {output_dir}"
+            )
+        np_db_path = final_np_db_path
+        initial_state_db_path = final_initial_state_db_path
+        summary_path = output_dir / "npt_run_summary.json"
+        if not summary_path.exists():
+            raise FileNotFoundError(
+                f"[power {power_index + 1}/{power_count}] resume requires an "
+                f"existing npt_run_summary.json to determine the previous cutoff: "
+                f"{summary_path}"
+            )
+        with open(summary_path, "r") as f:
+            prev_summary = json.load(f)
+        if simulation_cutoff_mode == "steps":
+            prev_cutoff = prev_summary.get("simulation_step_cutoff")
+            if prev_cutoff is None:
+                raise ValueError(
+                    f"[power {power_index + 1}/{power_count}] previous "
+                    f"simulation_step_cutoff not found in summary"
+                )
+            simulation_step_cutoff = int(prev_cutoff) + int(base_simulation_step_cutoff)
+            print(
+                f"[power {power_index + 1}/{power_count}] resuming: extending from {prev_cutoff} steps by {base_simulation_step_cutoff} steps to {simulation_step_cutoff}",
+                flush=True,
+            )
+        elif simulation_cutoff_mode == "physical-time":
+            prev_cutoff = prev_summary.get("simulation_time_cutoff_s")
+            if prev_cutoff is None:
+                raise ValueError(
+                    f"[power {power_index + 1}/{power_count}] previous "
+                    f"simulation_time_cutoff_s not found in summary"
+                )
+            simulation_time_cutoff_s = float(prev_cutoff) + float(base_simulation_time_cutoff_s)
+            print(
+                f"[power {power_index + 1}/{power_count}] resuming: extending from {prev_cutoff} s by {base_simulation_time_cutoff_s} s to {simulation_time_cutoff_s}",
+                flush=True,
+            )
+        run_npmc_needed = True
+    else:
+        np_db_path, initial_state_db_path = write_custom_npmc_databases(
+            source_np_db_path=source_np_db_path,
+            output_dir=db_work_dir,
+            interactions=interactions,
+            interaction_radius_bound_nm=float(
+                params["simulation_defaults"]["interaction_radius_bound_nm"]
+            ),
+            distance_factor_type=str(
+                params["simulation_defaults"]["distance_factor_type"]
+            ),
+        )
+        simulation_step_cutoff = base_simulation_step_cutoff
+        simulation_time_cutoff_s = base_simulation_time_cutoff_s
+        run_npmc_needed = True
+    cutoff_label = (
+        f"{simulation_step_cutoff} steps"
+        if simulation_cutoff_mode == "steps"
+        else f"{simulation_time_cutoff_s} s"
+    )
+    print(
+        f"[power {power_index + 1}/{power_count}] simulation cutoff: {cutoff_label}",
+        flush=True,
+    )
+
     manifest["simulation_step_cutoff"] = (
         None if simulation_step_cutoff is None else int(simulation_step_cutoff)
     )
     manifest["simulation_time_cutoff_s"] = (
         None if simulation_time_cutoff_s is None else float(simulation_time_cutoff_s)
     )
-    np_db_path, initial_state_db_path = write_custom_npmc_databases(
-        source_np_db_path=source_np_db_path,
-        output_dir=db_work_dir,
-        interactions=interactions,
-        interaction_radius_bound_nm=float(
-            params["simulation_defaults"]["interaction_radius_bound_nm"]
-        ),
-        distance_factor_type=str(
-            params["simulation_defaults"]["distance_factor_type"]
-        ),
-    )
+
     manifest_path = output_dir / "npt_interaction_manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(json_safe(manifest), f, indent=2)
@@ -1539,15 +1610,16 @@ def run_power_point(
     if args.dry_run:
         return build_record, None
 
-    run_npmc(
-        np_db_path,
-        initial_state_db_path,
-        output_dir,
-        args,
-        simulation_cutoff_mode=simulation_cutoff_mode,
-        simulation_step_cutoff=simulation_step_cutoff,
-        simulation_time_cutoff_s=simulation_time_cutoff_s,
-    )
+    if run_npmc_needed:
+        run_npmc(
+            np_db_path,
+            initial_state_db_path,
+            output_dir,
+            args,
+            simulation_cutoff_mode=simulation_cutoff_mode,
+            simulation_step_cutoff=simulation_step_cutoff,
+            simulation_time_cutoff_s=simulation_time_cutoff_s,
+        )
     replay = replay_trajectories(initial_state_db_path, interactions)
     summary = summarize_run(
         replay=replay,
@@ -1561,7 +1633,7 @@ def run_power_point(
     )
     with open(output_dir / "npt_run_summary.json", "w") as f:
         json.dump(json_safe(summary), f, indent=2)
-    plot_power_spectrum(
+    plot_npt_style_spectrum(
         params=params,
         excitation_power=float(power),
         tm_fraction=tm_fraction,
@@ -1580,11 +1652,14 @@ def run_power_point(
     )
 
     move_output_file(np_db_path, output_dir / "np.sqlite")
-    archived_initial_state_db_path = finalize_initial_state_database(
-        initial_state_db_path=initial_state_db_path,
-        output_dir=output_dir,
-        archive_root=trajectory_archive_root,
-    )
+    if resume_this_power:
+        archived_initial_state_db_path = final_initial_state_db_path.resolve()
+    else:
+        archived_initial_state_db_path = finalize_initial_state_database(
+            initial_state_db_path=initial_state_db_path,
+            output_dir=output_dir,
+            archive_root=trajectory_archive_root,
+        )
     build_record["np_db_path"] = str((output_dir / "np.sqlite").resolve())
     build_record["initial_state_db_path"] = str(
         (output_dir / "initial_state.sqlite").resolve()
@@ -1625,7 +1700,10 @@ def build_npt_dndt_from_summary(
     return dndt_rows
 
 
-def plot_power_spectrum(
+NPT_STYLE_SPECTRUM_REFERENCE = "/home/rpluo/Desktop/source/RNMC/examples/NPMC/nano_particle_analysis.ipynb"
+
+
+def plot_npt_style_spectrum(
     *,
     params: dict[str, Any],
     excitation_power: float,
@@ -1635,7 +1713,11 @@ def plot_power_spectrum(
     interactions: list[dict[str, Any]],
     output_dir: Path,
 ) -> None:
-    """Save a per-power emission spectrum using NPT's dN/dt spectrum helper."""
+    """Save an NPT-style signed-wavelength log-intensity spectrum plot.
+
+    This reproduces the visualization from the reference notebook
+    RNMC/examples/NPMC/nano_particle_analysis.ipynb.
+    """
     surface_enabled = (
         config["surface_quench_mode"] == "outer_layer"
         and float(config["surface_fraction"]) > 0.0
@@ -1656,38 +1738,71 @@ def plot_power_spectrum(
         dndt_rows,
         sk.dopants,
         lower_bound=-2000,
-        upper_bound=-300,
-        step=2,
+        upper_bound=1000,
+        step=5,
     )
-    wavelength_nm = np.abs(wavelength_signed)
-    order = np.argsort(wavelength_nm)
-    wavelength_nm = wavelength_nm[order]
-    spectrum = np.asarray(spectrum, dtype=float)[order]
+    wavelength_signed = np.asarray(wavelength_signed, dtype=float)
+    spectrum = np.asarray(spectrum, dtype=float)
+    order = np.argsort(wavelength_signed)
+    wavelength_signed = wavelength_signed[order]
+    spectrum = spectrum[order]
 
     spectrum_data = {
         "source": "NanoParticleTools.analysis.util.get_spectrum_wavelength_from_dndt",
+        "style_reference": NPT_STYLE_SPECTRUM_REFERENCE,
         "excitation_power_w_cm2": float(excitation_power),
-        "x_axis": "emission_wavelength_nm",
+        "x_axis": "signed_wavelength_nm_negative_emission_positive_absorption",
         "y_axis": "radiative_events_per_particle_s",
-        "wavelength_nm": [float(value) for value in wavelength_nm],
+        "wavelength_nm": [float(value) for value in wavelength_signed],
         "spectrum": [float(value) for value in spectrum],
     }
     with open(output_dir / "npt_emission_spectrum.json", "w") as f:
         json.dump(json_safe(spectrum_data), f, indent=2)
 
-    fig, ax = plt.subplots(dpi=300, figsize=(6.2, 4.2))
-    ax.plot(wavelength_nm, spectrum, linewidth=1.6)
-    ax.set_xlabel("Emission wavelength (nm)", fontsize=12)
-    ax.set_ylabel("Radiative events per particle per s", fontsize=12)
-    ax.set_title(
-        f"NPT spectrum | {format_power_tick(float(excitation_power))} W cm$^{{-2}}$",
-        fontsize=12,
+    fig, ax = plt.subplots(dpi=300, figsize=(5.0, 4.0))
+    ax.plot(wavelength_signed, np.log10(np.add(spectrum, 1)), linewidth=0.5)
+
+    # Emission/absorption arrow bar exactly as in the reference notebook.
+    ax.arrow(
+        50,
+        -0.5,
+        900,
+        0,
+        width=0.01,
+        head_width=0.2,
+        head_length=50,
+        lw=12,
+        color="red",
+        length_includes_head=True,
     )
-    ax.set_xlim(float(wavelength_nm[0]), float(wavelength_nm[-1]))
-    if np.any(spectrum > 0):
-        ax.set_ylim(bottom=0.0, top=float(np.max(spectrum)) * 1.08)
-    ax.grid(True, alpha=0.25)
-    fig.subplots_adjust(left=0.14, right=0.97, bottom=0.16, top=0.90)
+    ax.arrow(
+        -50,
+        -0.5,
+        -1900,
+        0,
+        width=0.01,
+        head_width=0.2,
+        head_length=50,
+        lw=12,
+        color="green",
+        length_includes_head=True,
+    )
+    ax.text(200, -0.57, "absorption", color="white")
+    ax.text(-1200, -0.57, "emissions", color="white")
+
+    ax.set_ylim(-1, 6)
+    ax.set_xticks([-2000, -1000, 0, 1000])
+    ax.set_xticklabels(["-2000", "-1000", "0", "1000"], fontsize=13)
+    ax.set_yticks([0, 1, 2, 3, 4, 5])
+    ax.set_yticklabels(["0", "1", "10", "100", "1k", "10k"], fontsize=13)
+    ax.set_xlabel("wavelength (nm)", fontsize=20)
+    ax.set_ylabel("Log10(Intensity)", fontsize=20)
+    ax.set_title(
+        f"{format_power_tick(float(excitation_power))} W/cm2",
+        fontsize=16,
+    )
+
+    fig.tight_layout()
     fig.savefig(output_dir / "npt_emission_spectrum.png")
     plt.close(fig)
 
@@ -1733,183 +1848,6 @@ def finalize_initial_state_database(
     final_initial_state_db_path.symlink_to(archived_path.resolve())
     return archived_path.resolve()
 
-
-def replay_trajectories(
-    initial_state_db_path: Path,
-    interactions: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Read event counts, final simulated times, and time-averaged n4 occupancy."""
-    simulation_time: dict[int, float] = {}
-    event_counts: dict[int, Counter] = defaultdict(Counter)
-    n4_time_integral: dict[int, float] = defaultdict(float)
-    n4_population_per_seed: dict[int, float] = {}
-    q24_total_count = 0
-    s12_total_count = 0
-    q24_after_s12_same_pair_count = 0
-    s12_after_q24_same_pair_count = 0
-
-    np_db_path = initial_state_db_path.with_name("np.sqlite")
-    with sqlite3.connect(np_db_path) as con:
-        site_rows = con.execute(
-            "SELECT site_id, species_id FROM sites ORDER BY site_id"
-        ).fetchall()
-    site_count = len(site_rows)
-    site_species = np.asarray(
-        [int(species_id) for _site_id, species_id in site_rows],
-        dtype=np.int8,
-    )
-    tm_site_count = int(np.sum(site_species == TM_SPECIES_ID))
-
-    interactions_by_id = {
-        int(row["interaction_id"]): {
-            "number_of_sites": int(row["number_of_sites"]),
-            "left_state_1": int(row["left_state_1"]),
-            "left_state_2": int(row["left_state_2"]),
-            "right_state_1": int(row["right_state_1"]),
-            "right_state_2": int(row["right_state_2"]),
-            "label": row["label"],
-        }
-        for row in interactions
-    }
-    s12_interaction_id = next(
-        (
-            int(row["interaction_id"])
-            for row in interactions
-            if row["interaction_type"] == "ET" and row["label"] == S12_CHANNEL_NAME
-        ),
-        None,
-    )
-    q24_interaction_id = next(
-        (
-            int(row["interaction_id"])
-            for row in interactions
-            if row["interaction_type"] == "ET" and row["label"] == Q21_CHANNEL_NAME
-        ),
-        None,
-    )
-
-    with sqlite3.connect(initial_state_db_path) as con:
-        rows = con.execute(
-            """
-            SELECT seed, step, time, site_id_1, site_id_2, interaction_id
-            FROM trajectories
-            ORDER BY seed, step
-            """
-        )
-        current_seed: int | None = None
-        previous_time = 0.0
-        site_states: np.ndarray | None = None
-        current_n4_count = 0
-        previous_event_by_seed: dict[int, tuple[int, tuple[int, int] | None]] = {}
-
-        def finalize_seed(seed: int | None, final_time: float) -> None:
-            if seed is None:
-                return
-            simulation_time[seed] = float(final_time)
-            if final_time > 0 and tm_site_count > 0:
-                n4_population_per_seed[seed] = (
-                    n4_time_integral[seed] / (float(tm_site_count) * float(final_time))
-                )
-            else:
-                n4_population_per_seed[seed] = 0.0
-
-        for seed, step, event_time, site_id_1, site_id_2, interaction_id in rows:
-            seed = int(seed)
-            step = int(step)
-            event_time = float(event_time)
-            interaction_id = int(interaction_id)
-            site_id_1 = int(site_id_1)
-            site_id_2 = int(site_id_2)
-
-            if current_seed != seed:
-                finalize_seed(current_seed, previous_time)
-                current_seed = seed
-                previous_time = 0.0
-                site_states = np.zeros(site_count, dtype=np.int8)
-                current_n4_count = 0
-
-            if site_states is None:
-                raise RuntimeError("site state replay was not initialized")
-
-            dt = event_time - previous_time
-            if dt < -1e-12:
-                raise ValueError(
-                    f"Trajectory time decreased for seed {seed} step {step}: "
-                    f"{event_time} < {previous_time}"
-                )
-            n4_time_integral[seed] += current_n4_count * max(dt, 0.0)
-            simulation_time[seed] = float(event_time)
-            event_counts[seed][interaction_id] += 1
-
-            interaction = interactions_by_id[interaction_id]
-            pair_key: tuple[int, int] | None = None
-            if interaction["number_of_sites"] == 2:
-                pair_key = (min(site_id_1, site_id_2), max(site_id_1, site_id_2))
-
-            previous_event = previous_event_by_seed.get(seed)
-            if q24_interaction_id is not None and interaction_id == q24_interaction_id:
-                q24_total_count += 1
-                if (
-                    previous_event is not None
-                    and s12_interaction_id is not None
-                    and previous_event[0] == s12_interaction_id
-                    and pair_key is not None
-                    and previous_event[1] == pair_key
-                ):
-                    q24_after_s12_same_pair_count += 1
-            if s12_interaction_id is not None and interaction_id == s12_interaction_id:
-                s12_total_count += 1
-                if (
-                    previous_event is not None
-                    and q24_interaction_id is not None
-                    and previous_event[0] == q24_interaction_id
-                    and pair_key is not None
-                    and previous_event[1] == pair_key
-                ):
-                    s12_after_q24_same_pair_count += 1
-
-            current_state_1 = int(site_states[site_id_1])
-            if current_state_1 != interaction["left_state_1"]:
-                raise ValueError(
-                    "Trajectory replay mismatch for seed "
-                    f"{seed} step {step} site {site_id_1}: "
-                    f"expected state {interaction['left_state_1']}, found {current_state_1}"
-                )
-            if int(site_species[site_id_1]) == TM_SPECIES_ID:
-                current_n4_count += int(interaction["right_state_1"] == N4_LEVEL)
-                current_n4_count -= int(current_state_1 == N4_LEVEL)
-            site_states[site_id_1] = interaction["right_state_1"]
-
-            if interaction["number_of_sites"] == 2:
-                current_state_2 = int(site_states[site_id_2])
-                if current_state_2 != interaction["left_state_2"]:
-                    raise ValueError(
-                        "Trajectory replay mismatch for seed "
-                        f"{seed} step {step} site {site_id_2}: "
-                        f"expected state {interaction['left_state_2']}, found {current_state_2}"
-                    )
-                if int(site_species[site_id_2]) == TM_SPECIES_ID:
-                    current_n4_count += int(interaction["right_state_2"] == N4_LEVEL)
-                    current_n4_count -= int(current_state_2 == N4_LEVEL)
-                site_states[site_id_2] = interaction["right_state_2"]
-
-            previous_event_by_seed[seed] = (interaction_id, pair_key)
-            previous_time = event_time
-
-        finalize_seed(current_seed, previous_time)
-
-    return {
-        "simulation_time": simulation_time,
-        "event_counts": event_counts,
-        "n4_time_integral": n4_time_integral,
-        "n4_population_per_seed": n4_population_per_seed,
-        "total_site_count": int(site_count),
-        "tm_site_count": int(tm_site_count),
-        "q24_total_count": q24_total_count,
-        "s12_total_count": s12_total_count,
-        "q24_after_s12_same_pair_count": q24_after_s12_same_pair_count,
-        "s12_after_q24_same_pair_count": s12_after_q24_same_pair_count,
-    }
 
 
 def summarize_run(
@@ -2020,8 +1958,25 @@ def summarize_run(
         "total_simulation_time_s": total_time,
         "n4_time_averaged_population": n4_time_averaged_population,
         "n4_population_per_seed": {
-            str(seed): float(value)
-            for seed, value in sorted(replay["n4_population_per_seed"].items())
+           str(seed): float(value)
+           for seed, value in sorted(replay["n4_population_per_seed"].items())
+        },
+        "n4_late_window_averages": {
+            str(seed): {
+                "A1": (
+                    float(integral_1)
+                    / (0.2 * float(replay["simulation_time"][seed]))
+                ),
+                "A2": (
+                    float(integral_2)
+                    / (0.4 * float(replay["simulation_time"][seed]))
+                ),
+                "T": float(replay["simulation_time"][seed]),
+            }
+            for seed, (integral_1, integral_2) in sorted(
+                replay.get("n4_late_window_integrals", {}).items()
+            )
+            if replay["simulation_time"].get(seed, 0.0) > 0
         },
         "n4_from_rad_800_proxy": n4_from_rad_800_proxy,
         "n4_rad_consistency_ratio": (
@@ -2154,7 +2109,20 @@ def summarize_run(
     }
 
 
-def plot_avalanche_curve(summaries: list[dict[str, Any]], output_root: Path) -> None:
+def _next_resume_plot_path(output_root: Path) -> Path:
+    """Return the first available npt_avalanche_curve_resume{N}.png path."""
+    for i in range(10):
+        candidate = output_root / f"npt_avalanche_curve_resume{i}.png"
+        if not candidate.exists():
+            return candidate
+    return output_root / "npt_avalanche_curve_resume9.png"
+
+
+def plot_avalanche_curve(
+    summaries: list[dict[str, Any]],
+    output_root: Path,
+    resume: bool = False,
+) -> None:
     """Plot 700 nm and 800 nm avalanche proxies versus excitation power."""
     if not summaries:
         return
@@ -2186,7 +2154,7 @@ def plot_avalanche_curve(summaries: list[dict[str, Any]], output_root: Path) -> 
         markersize=4.5,
         label="700 nm proxy (3F3 radiative)",
     )
-    ax.set_xlabel("Excitation power at 1064 nm (W cm$^{-2}$)", fontsize=13)
+    ax.set_xlabel("Excitation power at 1064 nm (W/cm2)", fontsize=13)
     ax.set_ylabel("Radiative events per particle per s", fontsize=13)
     ax.tick_params(axis="both", which="major", labelsize=11)
     ax.tick_params(axis="both", which="minor", labelsize=10)
@@ -2234,6 +2202,10 @@ def plot_avalanche_curve(summaries: list[dict[str, Any]], output_root: Path) -> 
     )
     fig.subplots_adjust(bottom=0.18, left=0.14, right=0.97, top=0.96)
     fig.savefig(output_root / "npt_avalanche_curve.png")
+    if resume:
+        resume_path = _next_resume_plot_path(output_root)
+        fig.savefig(resume_path)
+        print(f"Wrote resume avalanche curve: {resume_path}", flush=True)
     plt.close(fig)
 
 
@@ -2353,6 +2325,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--include-zero-rates", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Build DBs and manifests but skip NPMC.")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "If the trajectory database already exists, run NPMC only long enough "
+            "to reach the configured cutoff (extend), then replay and summarize. "
+            "If the trajectory already reaches the cutoff, skip NPMC and re-run "
+            "post-processing instead."
+        ),
+    )
+    parser.add_argument(
+        "--resume-power-indices",
+        default=None,
+        help=(
+            "Comma-separated list of power indices to process when using --resume. "
+            "If omitted, all power points are processed."
+        ),
+    )
     parser.add_argument("--powers", default=None, help="Comma/space separated powers in W cm^-2.")
     parser.add_argument(
         "--power-sampling-mode",
@@ -2395,7 +2385,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--power-parallel-total-slots",
         type=int,
-        default=None,
+        default=24,
         help=(
             "Total CPU slots available for the power-parallel scheduler. Defaults "
             "to Slurm environment variables when present."
@@ -2539,8 +2529,9 @@ def main() -> None:
             else float(args.resolved_simulation_time)
         ),
     }
-    with open(output_root / "npt_production_config.json", "w") as f:
-        json.dump(root_config, f, indent=2)
+    if not args.dry_run:
+        with open(output_root / "npt_production_config.json", "w") as f:
+            json.dump(root_config, f, indent=2)
 
     power_jobs = [
         (int(power_index), float(power))
@@ -2548,6 +2539,41 @@ def main() -> None:
             enumerate(powers), key=lambda item: item[1], reverse=True
         )
     ]
+    if args.resume and not output_root.exists():
+        parser.error(f"--resume requires existing output root: {output_root}")
+
+    if args.resume and args.resume_power_indices is None:
+        print(
+            "Auto-selecting unconverged power indices for resume extension...",
+            flush=True,
+        )
+        from convergence_diagnostic import find_unconverged_power_indices
+
+        unconverged_indices = find_unconverged_power_indices(
+            output_root,
+            drift_tol=0.10,
+            min_pass_frac=0.75,
+        )
+        if not unconverged_indices:
+            print(
+                "All existing power points are converged; nothing to extend.",
+                flush=True,
+            )
+            return
+        args.resume_power_indices = ",".join(str(i) for i in unconverged_indices)
+        print(
+            f"Extending power indices: {args.resume_power_indices}",
+            flush=True,
+        )
+
+    if args.resume_power_indices is not None:
+        if not args.resume:
+            parser.error("--resume-power-indices requires --resume")
+        allowed = {int(x.strip()) for x in args.resume_power_indices.split(",")}
+        power_jobs = [(idx, pwr) for idx, pwr in power_jobs if idx in allowed]
+        if not power_jobs:
+            parser.error(f"--resume-power-indices did not match any power index")
+
     if auto_power_parallel:
         print(
             f"Running {len(power_jobs)} power points with {power_parallel_workers} concurrent workers "
@@ -2602,8 +2628,9 @@ def main() -> None:
     root_config["npt_raw_vs_npmc_readin_by_power"] = build_power_rate_tables(
         build_records
     )
-    with open(output_root / "npt_production_config.json", "w") as f:
-        json.dump(json_safe(root_config), f, indent=2)
+    if not args.dry_run:
+        with open(output_root / "npt_production_config.json", "w") as f:
+            json.dump(json_safe(root_config), f, indent=2)
 
     max_local_log_slope_800 = None
     max_local_log_slope_800_power_w_cm2 = None
@@ -2641,7 +2668,7 @@ def main() -> None:
         json.dump(json_safe(sweep_summary), f, indent=2)
 
     if not args.dry_run:
-        plot_avalanche_curve(summaries, output_root)
+        plot_avalanche_curve(summaries, output_root, resume=args.resume)
 
 
 if __name__ == "__main__":

@@ -1447,7 +1447,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--parallel-segments",
         type=int,
-        default=8,
+        default=24,
         help="Number of MP4 segments to render in parallel for --animate. Use 1 to disable parallel rendering. Default: 8.",
     )
     parser.add_argument(
@@ -1502,7 +1502,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output MP4 path for --animate. Defaults to <run_dir>/<power>_<projection>.mp4, for example 15k_xy.mp4.",
     )
-    parser.add_argument("--dpi", type=int, default=120, help="Figure DPI.")
+    parser.add_argument("--dpi", type=int, default=60, help="Figure DPI.")
     return parser
 
 
