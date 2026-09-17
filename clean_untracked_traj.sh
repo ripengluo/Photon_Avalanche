@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORK_ROOT="/home/rpluo/Desktop/project_MFML_UCNP/kmc_ANP/Tm_4p5-NPT"
-ARCHIVE_ROOT="/home/rpluo/Desktop/hdd_large/KMC_trajectories/Tm_4p5-NPT"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+WORK_ROOT="$SCRIPT_DIR"
+ARCHIVE_ROOT="/home/rpluo/Desktop/hdd_large/KMC_trajectories/accelerate_convergence"
 DELETE=0
 
 usage() {
@@ -23,10 +24,12 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --work-root)
+      [[ $# -ge 2 ]] || { echo "--work-root requires a path" >&2; exit 2; }
       WORK_ROOT="$2"
       shift 2
       ;;
     --archive-root)
+      [[ $# -ge 2 ]] || { echo "--archive-root requires a path" >&2; exit 2; }
       ARCHIVE_ROOT="$2"
       shift 2
       ;;

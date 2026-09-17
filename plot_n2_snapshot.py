@@ -5,11 +5,14 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import math
+import os
 import sqlite3
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Iterator
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import matplotlib
 
@@ -92,6 +95,23 @@ def load_site_count(np_db_path: Path) -> int:
     return int(row[0])
 
 
+def load_initial_site_states(
+    initial_state_db_path: Path,
+    site_count: int,
+) -> np.ndarray:
+    """Load the actual trajectory starting state, including prepared runs."""
+    with sqlite3.connect(initial_state_db_path.resolve()) as con:
+        rows = con.execute(
+            "SELECT site_id, degree_of_freedom FROM initial_state ORDER BY site_id"
+        ).fetchall()
+    if [int(site_id) for site_id, _state in rows] != list(range(site_count)):
+        raise ValueError(
+            f"initial_state does not match the {site_count}-site geometry in "
+            f"{initial_state_db_path}"
+        )
+    return np.asarray([int(state) for _site_id, state in rows], dtype=np.int8)
+
+
 def load_site_geometry(np_db_path: Path) -> tuple[np.ndarray, np.ndarray]:
     with sqlite3.connect(np_db_path) as con:
         rows = con.execute("SELECT x, y, z, species_id FROM sites ORDER BY site_id").fetchall()
@@ -132,6 +152,37 @@ def load_selected_seed(run_dir: Path, initial_state_db_path: Path, seed_arg: str
     if row is None:
         raise ValueError(f"No trajectory rows found in {initial_state_db_path}")
     return int(row[0])
+
+
+def resolve_initial_state_db(run_dir: Path, seed_arg: str) -> Path:
+    """Resolve either a combined cold-start DB or one prepared seed DB."""
+    combined_path = run_dir / "initial_state.sqlite"
+    if combined_path.exists():
+        return combined_path
+
+    seed_paths = sorted(run_dir.glob("restart/seed_*/initial_state.sqlite"))
+    if not seed_paths:
+        raise FileNotFoundError(f"No target trajectory database found in {run_dir}")
+    if seed_arg != "auto":
+        selected = run_dir / "restart" / f"seed_{int(seed_arg)}" / "initial_state.sqlite"
+        if not selected.exists():
+            raise FileNotFoundError(f"No target trajectory database for seed {seed_arg}")
+        return selected
+
+    summary_path = run_dir / "trajectory_3d_overview_summary.json"
+    if summary_path.exists():
+        summary = load_json(summary_path)
+        selected_seed = summary.get("selected_seed", summary.get("best_seed"))
+        if selected_seed is not None:
+            selected = (
+                run_dir
+                / "restart"
+                / f"seed_{int(selected_seed)}"
+                / "initial_state.sqlite"
+            )
+            if selected.exists():
+                return selected
+    return seed_paths[0]
 
 
 def load_total_time(
@@ -379,11 +430,11 @@ def replay_snapshot(
     total_time: float,
 ) -> dict[str, Any]:
     site_count = load_site_count(np_db_path)
-    site_states = np.zeros(site_count, dtype=np.int8)
+    site_states = load_initial_site_states(initial_state_db_path, site_count)
 
     rows = iter_trajectory_rows(initial_state_db_path, seed=seed)
     display_count = int(np.count_nonzero(projection_mask))
-    display_level_counts = empty_level_counts()
+    display_level_counts = count_level_states(site_states, projection_mask)
 
     last_time = 0.0
     last_step = 0
@@ -391,11 +442,11 @@ def replay_snapshot(
     best_state = site_states.copy()
     best_time = 0.0
     best_step = 0
-    best_n2_count = 0
+    best_n2_count = int(display_level_counts["3F4"])
     best_level_counts = copy_level_counts(display_level_counts)
-    found_tail_candidate = False
 
     tail_start_time = total_time * (1.0 - SNAPSHOT_TAIL_FRACTION)
+    found_tail_candidate = tail_start_time <= 0.0
     tail_duration = max(float(total_time) - float(tail_start_time), 0.0)
     tail_fraction = min(max(float(time_fraction), 0.0), 1.0)
     target_time = (
@@ -565,6 +616,18 @@ def background_styles(states: np.ndarray, depth_norm: np.ndarray) -> tuple[np.nd
 
 def empty_level_counts() -> dict[str, int]:
     return {label: 0 for label in LEVEL_COUNT_LABELS}
+
+
+def count_level_states(
+    states: np.ndarray,
+    display_mask: np.ndarray,
+) -> dict[str, int]:
+    counts = empty_level_counts()
+    for state in np.asarray(states, dtype=np.int8)[np.asarray(display_mask, dtype=bool)]:
+        bucket = level_count_bucket(int(state))
+        if bucket is not None:
+            counts[bucket] += 1
+    return counts
 
 
 def copy_level_counts(level_counts: dict[str, int]) -> dict[str, int]:
@@ -827,9 +890,9 @@ def build_animation_frames(
     use_full_trajectory: bool = False,
 ) -> dict[str, Any]:
     site_count = load_site_count(np_db_path)
-    site_states = np.zeros(site_count, dtype=np.int8)
+    site_states = load_initial_site_states(initial_state_db_path, site_count)
     display_count = int(np.count_nonzero(projection_mask))
-    display_level_counts = empty_level_counts()
+    display_level_counts = count_level_states(site_states, projection_mask)
     if step_span <= 0 and not use_full_trajectory:
         raise ValueError("Animation step span must be positive")
     if step_interval <= 0:
@@ -849,7 +912,6 @@ def build_animation_frames(
 
     rows = iter_trajectory_rows(initial_state_db_path, seed=seed)
     current_row = next(rows, None)
-    last_step = -1
     last_time = 0.0
     frames: list[dict[str, Any]] = []
 
@@ -875,7 +937,6 @@ def build_animation_frames(
                 if projection_mask[site_id]:
                     update_level_counts(display_level_counts, old_state, new_state)
 
-            last_step = step
             last_time = event_time
             current_row = next(rows, None)
 
@@ -967,7 +1028,7 @@ def render_snapshot(
         hist = gaussian_filter(hist.T, sigma=float(sigma))
         if np.max(hist) > 0:
             heat = hist / float(np.max(hist))
-            im = ax.imshow(
+            ax.imshow(
                 heat,
                 origin="lower",
                 extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
@@ -1397,7 +1458,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Plot one trajectory snapshot as an EDS-like n2 map."
     )
-    parser.add_argument("run_dir", help="Path to the run directory, for example baseline/power_06_10000")
+    parser.add_argument("run_dir", help="Path to one power_* output directory")
     parser.add_argument(
         "--seed",
         default="auto",
@@ -1407,7 +1468,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=("peak-n2", "fraction", "step", "final"),
         default="peak-n2",
-        help="How to choose the snapshot from the trajectory. peak-n2 and fraction are restricted to the last 30% of the trajectory.",
+        help="How to choose the snapshot from the trajectory. peak-n2 and fraction are restricted to the last 30%% of the trajectory.",
     )
     parser.add_argument(
         "--animate",
@@ -1454,7 +1515,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--time-fraction",
         type=float,
         default=0.55,
-        help="Used only with --mode fraction. Pick the state at this fraction of the last 30% of the selected seed's total time.",
+        help="Used only with --mode fraction. Pick the state at this fraction of the last 30%% of the selected seed's total time.",
     )
     parser.add_argument(
         "--step",
@@ -1513,7 +1574,7 @@ def main() -> None:
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
     np_db_path = run_dir / "np.sqlite"
-    initial_state_db_path = run_dir / "initial_state.sqlite"
+    initial_state_db_path = resolve_initial_state_db(run_dir, str(args.seed))
     manifest = load_manifest(run_dir)
     interactions = load_interactions(manifest)
     positions, species_ids = load_site_geometry(np_db_path)

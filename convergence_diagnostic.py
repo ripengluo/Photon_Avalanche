@@ -51,9 +51,17 @@ def replay_trajectories(
     n4_level: int = N4_LEVEL,
     s12_channel_name: str = S12_CHANNEL_NAME,
     q21_channel_name: str = Q21_CHANNEL_NAME,
+    n4_trace_samples: int | None = None,
+    n4_trace_final_step: int | None = None,
 ) -> dict[str, Any]:
-    """Read event counts, final simulated times, and time-averaged n4 occupancy."""
+    """Read trajectory observables and optionally sample bounded N4 traces.
+
+    When ``n4_trace_samples`` and ``n4_trace_final_step`` are provided, N4 is
+    sampled during this replay at evenly spaced KMC steps. This avoids a second
+    full trajectory scan solely to produce an N4-versus-time/step plot.
+    """
     simulation_time: dict[int, float] = {}
+    final_step: dict[int, int] = {}
     event_counts: dict[int, Counter] = defaultdict(Counter)
     n4_time_integral: dict[int, float] = defaultdict(float)
     n4_population_per_seed: dict[int, float] = {}
@@ -62,6 +70,20 @@ def replay_trajectories(
     s12_total_count = 0
     q24_after_s12_same_pair_count = 0
     s12_after_q24_same_pair_count = 0
+    n4_trace_by_seed: dict[int, dict[str, list[float]]] = {}
+    trace_targets: np.ndarray | None = None
+    if n4_trace_samples is not None or n4_trace_final_step is not None:
+        if n4_trace_samples is None or n4_trace_final_step is None:
+            raise ValueError(
+                "n4_trace_samples and n4_trace_final_step must be provided together"
+            )
+        if n4_trace_samples < 2 or n4_trace_final_step < 1:
+            raise ValueError("N4 trace sampling requires at least two samples and one step")
+        trace_targets = np.unique(
+            np.rint(
+                np.linspace(0, int(n4_trace_final_step), int(n4_trace_samples))
+            ).astype(np.int64)
+        )
 
     # Resolve symlinks and use a memory journal so SQLite does not try to write
     # journal files next to the (possibly symlinked) archive database.
@@ -73,11 +95,36 @@ def replay_trajectories(
             "SELECT site_id, species_id FROM sites ORDER BY site_id"
         ).fetchall()
     site_count = len(site_rows)
+    site_ids = [int(site_id) for site_id, _species_id in site_rows]
+    if site_ids != list(range(site_count)):
+        raise ValueError(
+            f"Expected contiguous site IDs 0..{site_count - 1} in {np_db_path}"
+        )
     site_species = np.asarray(
         [int(species_id) for _site_id, species_id in site_rows],
         dtype=np.int8,
     )
     tm_site_count = int(np.sum(site_species == tm_species_id))
+
+    with sqlite3.connect(resolved_initial_state_db_path) as con:
+        initial_rows = con.execute(
+            "SELECT site_id, degree_of_freedom FROM initial_state ORDER BY site_id"
+        ).fetchall()
+    if [int(site_id) for site_id, _state in initial_rows] != site_ids:
+        raise ValueError(
+            "initial_state site IDs do not match the nanoparticle geometry in "
+            f"{resolved_initial_state_db_path}"
+        )
+    initial_site_states = np.asarray(
+        [int(state) for _site_id, state in initial_rows],
+        dtype=np.int8,
+    )
+    initial_n4_count = int(
+        np.count_nonzero(
+            (site_species == int(tm_species_id))
+            & (initial_site_states == int(n4_level))
+        )
+    )
 
     interactions_by_id = {
         int(row["interaction_id"]): {
@@ -109,6 +156,12 @@ def replay_trajectories(
 
     with sqlite3.connect(resolved_initial_state_db_path) as con:
         con.execute("PRAGMA journal_mode = MEMORY")
+        checkpoint_times = {
+            int(seed): float(time_s)
+            for seed, time_s in con.execute(
+                "SELECT seed, time FROM interrupt_cutoff"
+            )
+        }
         rows = con.execute(
             """
             SELECT seed, step, time, site_id_1, site_id_2, interaction_id
@@ -120,9 +173,11 @@ def replay_trajectories(
         previous_time = 0.0
         site_states: np.ndarray | None = None
         current_n4_count = 0
+        trace_target_index = 0
         previous_event_by_seed: dict[int, tuple[int, tuple[int, int] | None]] = {}
-        seed_times: list[float] = []
-        seed_n4: list[int] = []
+        current_late_integral_1 = 0.0
+        current_late_integral_2 = 0.0
+        current_final_time_hint = 0.0
 
         def finalize_seed(seed: int | None, final_time: float) -> None:
             if seed is None:
@@ -135,29 +190,24 @@ def replay_trajectories(
             else:
                 n4_population_per_seed[seed] = 0.0
 
-            # Late-window n4 integrals for convergence diagnostics.
-            # Window 1: [0.6 T, 0.8 T]; Window 2: [0.6 T, T].
-            late_start_frac = 0.6
-            late_mid_frac = 0.8
-            t_start = late_start_frac * final_time
-            t_mid = late_mid_frac * final_time
-            integral_1 = 0.0
-            integral_2 = 0.0
-            prev = 0.0
-            for t, n in zip(seed_times, seed_n4):
-                seg_a = max(prev, t_start)
-                seg_b_full = min(t, final_time)
-                seg_b_half = min(t, t_mid)
-                if seg_b_half > seg_a:
-                    integral_1 += n * (seg_b_half - seg_a)
-                if seg_b_full > seg_a:
-                    integral_2 += n * (seg_b_full - seg_a)
-                prev = t
-                if prev >= final_time:
-                    break
-            n4_late_window_integrals[seed] = (integral_1, integral_2)
-            seed_times.clear()
-            seed_n4.clear()
+            n4_late_window_integrals[seed] = (
+                current_late_integral_1,
+                current_late_integral_2,
+            )
+
+        def accumulate_late_interval(start: float, end: float) -> None:
+            """Accumulate current N4 occupancy over the two late windows."""
+            nonlocal current_late_integral_1, current_late_integral_2
+            if end <= start or current_final_time_hint <= 0.0:
+                return
+            late_start = 0.6 * current_final_time_hint
+            late_mid = 0.8 * current_final_time_hint
+            overlap_1 = max(0.0, min(end, late_mid) - max(start, late_start))
+            overlap_2 = max(
+                0.0, min(end, current_final_time_hint) - max(start, late_start)
+            )
+            current_late_integral_1 += current_n4_count * overlap_1
+            current_late_integral_2 += current_n4_count * overlap_2
 
         for seed, step, event_time, site_id_1, site_id_2, interaction_id in rows:
             seed = int(seed)
@@ -171,8 +221,24 @@ def replay_trajectories(
                 finalize_seed(current_seed, previous_time)
                 current_seed = seed
                 previous_time = 0.0
-                site_states = np.zeros(site_count, dtype=np.int8)
-                current_n4_count = 0
+                site_states = initial_site_states.copy()
+                current_n4_count = initial_n4_count
+                trace_target_index = 0
+                current_late_integral_1 = 0.0
+                current_late_integral_2 = 0.0
+                current_final_time_hint = checkpoint_times.get(seed, 0.0)
+                if trace_targets is not None:
+                    n4_trace_by_seed[seed] = {
+                        "step": [0.0],
+                        "time_s": [0.0],
+                        "n4_population": [
+                            initial_n4_count / float(tm_site_count)
+                            if tm_site_count > 0
+                            else 0.0
+                        ],
+                        "n4_running_average": [0.0],
+                    }
+                    trace_target_index = 1
 
             if site_states is None:
                 raise RuntimeError("site state replay was not initialized")
@@ -184,12 +250,10 @@ def replay_trajectories(
                     f"{event_time} < {previous_time}"
                 )
             n4_time_integral[seed] += current_n4_count * max(dt, 0.0)
+            accumulate_late_interval(previous_time, event_time)
             simulation_time[seed] = float(event_time)
+            final_step[seed] = step
             event_counts[seed][interaction_id] += 1
-
-            # Buffer piecewise-constant n4 trajectory for late-window integration.
-            seed_times.append(event_time)
-            seed_n4.append(current_n4_count)
 
             interaction = interactions_by_id[interaction_id]
             pair_key: tuple[int, int] | None = None
@@ -243,6 +307,27 @@ def replay_trajectories(
                     current_n4_count -= int(current_state_2 == n4_level)
                 site_states[site_id_2] = interaction["right_state_2"]
 
+            if trace_targets is not None:
+                trace = n4_trace_by_seed[seed]
+                while (
+                    trace_target_index < len(trace_targets)
+                    and step >= int(trace_targets[trace_target_index])
+                ):
+                    trace["step"].append(float(trace_targets[trace_target_index]))
+                    trace["time_s"].append(event_time)
+                    trace["n4_population"].append(
+                        current_n4_count / float(tm_site_count)
+                        if tm_site_count > 0
+                        else 0.0
+                    )
+                    trace["n4_running_average"].append(
+                        n4_time_integral[seed]
+                        / (event_time * float(tm_site_count))
+                        if event_time > 0.0 and tm_site_count > 0
+                        else 0.0
+                    )
+                    trace_target_index += 1
+
             previous_event_by_seed[seed] = (interaction_id, pair_key)
             previous_time = event_time
 
@@ -250,6 +335,7 @@ def replay_trajectories(
 
     return {
         "simulation_time": simulation_time,
+        "final_step": final_step,
         "event_counts": event_counts,
         "n4_time_integral": n4_time_integral,
         "n4_population_per_seed": n4_population_per_seed,
@@ -260,6 +346,7 @@ def replay_trajectories(
         "s12_total_count": s12_total_count,
         "q24_after_s12_same_pair_count": q24_after_s12_same_pair_count,
         "s12_after_q24_same_pair_count": s12_after_q24_same_pair_count,
+        "n4_trace_by_seed": n4_trace_by_seed,
     }
 
 def load_json(path: Path) -> dict:
@@ -316,17 +403,28 @@ def ensure_n4_late_window_averages(
     if not interactions:
         raise ValueError(f"No interactions found in manifest: {manifest_path}")
 
-    initial_state_db_path = run_dir / "initial_state.sqlite"
-    if not initial_state_db_path.exists():
+    combined_db_path = run_dir / "initial_state.sqlite"
+    initial_state_db_paths = (
+        [combined_db_path]
+        if combined_db_path.exists()
+        else sorted(run_dir.glob("restart/seed_*/initial_state.sqlite"))
+    )
+    if not initial_state_db_paths:
         raise FileNotFoundError(
-            f"Missing trajectory database: {initial_state_db_path}"
+            f"Missing target trajectory databases in {run_dir}"
         )
     np_db_path = run_dir / "np.sqlite"
     if not np_db_path.exists():
         raise FileNotFoundError(f"Missing geometry database: {np_db_path}")
 
-    replay = replay_trajectories(initial_state_db_path, interactions)
-    averages = compute_n4_late_window_averages(replay)
+    averages = {}
+    for initial_state_db_path in initial_state_db_paths:
+        replay = replay_trajectories(initial_state_db_path, interactions)
+        replay_averages = compute_n4_late_window_averages(replay)
+        overlap = set(averages) & set(replay_averages)
+        if overlap:
+            raise ValueError(f"Duplicate seeds across target databases: {overlap}")
+        averages.update(replay_averages)
 
     if write_back:
         summary_path = run_dir / "npt_run_summary.json"
@@ -512,7 +610,7 @@ def main() -> None:
     if "error" in result:
         print(f"Error: {result['error']}")
         sys.exit(1)
-    print(f"Windows: [0.6T, 0.8T] vs [0.6T, T]")
+    print("Windows: [0.6T, 0.8T] vs [0.6T, T]")
     print(
         f"Seeds: {result['seed_count']}  Passed: {result['pass_count']} "
         f"({result['pass_fraction']:.2%})"

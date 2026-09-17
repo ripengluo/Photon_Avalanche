@@ -1,27 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 RUN_ROOT [tm_npt_kmc_production.py options]" >&2
+  exit 2
+fi
 
-python -B ./tm_npt_kmc_production.py \
-  --core-radius-a 50 \
-  --surface-quench-mode outer_layer \
-  --shell-thickness-a 25 \
-  --tm-fraction 0.08 \
-  --npt-cr-mode exported \
-  --sigma-esa-scale 1.0 \
-  --s12-scale 1 \
-  --power-sampling-mode centered-gaussian \
-  --power-gaussian-sigma-decades 0.05 \
-  --power-center 13000 \
-  --power-min 3000 \
-  --power-max 50000 \
-  --power-count 12 \
-  --num-sims 8 \
-  --base-seed 1000 \
-  --thread-count 8 \
-  --power-parallel-total-slots 24 \
-  --em-mode all \
-  --em-scale 1.0 \
-  --simulation-length 50000000 \
-  --output-root r50-8p0-baseline-50M \
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RUN_ROOT="$1"
+shift
+EXTENSION_STEPS="${EXTENSION_STEPS:-70000000}"
+
+python -B "$SCRIPT_DIR/tm_npt_kmc_production.py" \
   --resume \
+  --output-root "$RUN_ROOT" \
+  --simulation-length "$EXTENSION_STEPS" \
+  "$@"

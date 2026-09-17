@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+nohup.out
+
+# Generated kMC run data.
+10nm-8p0Tm/
+14nm-8p0Tm/

@@ -24,9 +24,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import matplotlib
 
@@ -65,6 +68,10 @@ TM_ENERGIES_CM = [
     36603.0,
     38344.0,
 ]
+
+# The species database reports level energies as wavenumbers.  Diagram labels
+# use eV relative to the ground level, which is conventionally zero.
+CM_INVERSE_TO_EV = 1.239841984e-4
 
 COLORS = {
     "ET": "#3158a6",
@@ -151,9 +158,10 @@ def extract_arrows(
     rate_key: str,
     min_rate: float,
     max_by_kind: dict[str, int],
+    summary_name: str = "npt_run_summary.json",
 ) -> tuple[list[Process], dict]:
     manifest = json.loads((run_dir / "npt_interaction_manifest.json").read_text())
-    summary = json.loads((run_dir / "npt_run_summary.json").read_text())
+    summary = json.loads((run_dir / summary_name).read_text())
 
     interactions = {int(row["interaction_id"]): row for row in manifest["interactions"]}
     per_interaction = summary.get("per_interaction", [])
@@ -281,6 +289,12 @@ def superscript_label(label: str) -> str:
     return rf"$^{{{mult}}}{letter}_{{{j}}}$"
 
 
+def format_level_label(label: str, energy_cm: float, ground_energy_cm: float) -> str:
+    """Format a spectroscopic level label with its energy above the ground state."""
+    energy_ev = (energy_cm - ground_energy_cm) * CM_INVERSE_TO_EV
+    return f"{superscript_label(label)} ({energy_ev:.2f} eV)"
+
+
 def draw_arrow(ax, x: float, y0: float, y1: float, color: str, dashed: bool, lw: float):
     patch = FancyArrowPatch(
         (x, y0),
@@ -348,10 +362,13 @@ def plot_run(
     min_rate: float,
     max_by_kind: dict[str, int],
     dpi: int,
+    summary_name: str = "npt_run_summary.json",
 ) -> bool:
     labels, energies = load_species_data()
     y_positions = [float(energy) for energy in energies]
-    arrows, summary = extract_arrows(run_dir, rate_key, min_rate, max_by_kind)
+    arrows, summary = extract_arrows(
+        run_dir, rate_key, min_rate, max_by_kind, summary_name=summary_name
+    )
     if not arrows:
         print(f"SKIP {run_dir.name}: no arrows above min-rate")
         return False
@@ -362,9 +379,17 @@ def plot_run(
     ax.axis("off")
 
     x0, x1 = 0.06, 1.32
+    ground_energy = min(y_positions)
     for i, (label, y) in enumerate(zip(labels, y_positions)):
         ax.hlines(y, x0, x1, color="black", lw=1.8)
-        ax.text(1.37, y, superscript_label(label), va="center", ha="left", fontsize=15)
+        ax.text(
+            1.37,
+            y,
+            format_level_label(label, y, ground_energy),
+            va="center",
+            ha="left",
+            fontsize=15,
+        )
         ax.text(0.025, y, str(i), va="center", ha="right", fontsize=9, color="#555555")
 
     groups = {

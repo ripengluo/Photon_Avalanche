@@ -14,7 +14,7 @@ from scipy.spatial import cKDTree
 
 
 ROOT = Path(__file__).resolve().parent
-PROJECT_ROOT = ROOT.parent
+PROJECT_ROOT = ROOT.parents[1]
 NPT_SRC = PROJECT_ROOT / "NanoParticleTools" / "src"
 if NPT_SRC.exists() and str(NPT_SRC) not in sys.path:
     sys.path.insert(0, str(NPT_SRC))

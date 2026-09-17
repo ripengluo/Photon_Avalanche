@@ -1,45 +1,57 @@
 #!/usr/bin/env bash
-#SBATCH -p cm1 -A pc_lnpmc -q cm1_normal
-#SBATCH -N 1 -t 72:00:00 -n 48 -c 1 --mem=192G
-#SBATCH -J kmc_npt12_parallel
+#SBATCH --partition=cm1
+#SBATCH --account=pc_lnpmc
+#SBATCH --qos=cm1_normal
+#SBATCH --nodes=1
+#SBATCH --ntasks=24
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=192G
+#SBATCH --time=72:00:00
+#SBATCH --job-name=kmc_npt_prepared
+#SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
 
-# Current NPT PA-loop test:
-# - 5 nm core (core radius 50 A)
-# - 2.5 nm shell (shell thickness 25 A)
-# - NPT exported CR rows
-# - sigma_esa_scale = 1
-# - s12_scale = 1 (no beta_s12 correction)
-# - q21/s54/s45 unchanged
-# - EM enabled with em_scale = 1.0
-# - outer-layer surface quenching enabled
-# - uniform step cutoff: every power runs the same 5M steps
-#
-# Power parallelism is handled automatically inside tm_npt_kmc_production.py.
-# With the current Slurm allocation (-n 48) and --thread-count 8, the script
-# will run up to floor(48 / 8) = 6 powers concurrently.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-python -B "./tm_npt_kmc_production.py" \
-  --core-radius-a 80 \
-  --surface-quench-mode outer_layer \
-  --shell-thickness-a 25 \
-  --tm-fraction 0.08 \
-  --npt-cr-mode exported \
-  --sigma-esa-scale 1.0 \
-  --s12-scale 1 \
+JOB_TAG="${SLURM_JOB_ID:-manual}"
+OUTPUT_ROOT="14nm-8p0Tm"
+ARCHIVE_ROOT="${ARCHIVE_ROOT:-/home/rpluo/Desktop/hdd_large/KMC_trajectories/accelerate_convergence}"
+TOTAL_SLOTS="${SLURM_NTASKS:-24}"
+
+echo "output_root=$OUTPUT_ROOT"
+echo "archive_root=$ARCHIVE_ROOT"
+echo "total_slots=$TOTAL_SLOTS"
+
+python -B ./tm_npt_kmc_production.py \
+  --output-root "$OUTPUT_ROOT" \
+  --trajectory-archive-root "$ARCHIVE_ROOT" \
   --power-sampling-mode centered-gaussian \
+  --power-center 11000 \
   --power-gaussian-sigma-decades 0.05 \
-  --power-center 13000 \
   --power-min 3000 \
   --power-max 50000 \
   --power-count 12 \
+  --simulation-length 70000000 \
   --num-sims 8 \
+  --base-seed 1000 \
   --thread-count 8 \
+  --restart-workers 8 \
+  --doping-seed 23 \
+  --core-radius-a 70 \
+  --shell-thickness-a 25 \
+  --tm-fraction 0.08 \
+  --npt-cr-mode exported \
+  --sigma-esa-scale 1 \
+  --q21-scale 1 \
+  --s54-scale 1 \
+  --s45-scale 1 \
+  --s12-scale 1 \
   --em-mode all \
-  --em-scale 1.0 \
-  --simulation-length 50000000 \
-  --output-root r80-8p0-baseline \
-#  --power-parallel-total-slots 24
-#  --cutoff-mode physical-time \
-#  --simulation-time 1.0
+  --em-scale 1 \
+  --surface-quench-mode outer_layer \
+  --surface-species Surface \
+  --surface-fraction 0.2 \
+  --power-parallel-total-slots "$TOTAL_SLOTS" \
+  "$@"
