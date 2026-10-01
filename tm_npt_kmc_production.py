@@ -44,7 +44,11 @@ from convergence_diagnostic import (
 )
 from NanoParticleTools.core import NPMCInput
 from NanoParticleTools.analysis.util import get_spectrum_wavelength_from_dndt
-from NanoParticleTools.inputs.nanoparticle import DopedNanoparticle, SphericalConstraint
+from NanoParticleTools.inputs.nanoparticle import (
+    DopedNanoparticle,
+    SphericalConstraint,
+    get_nayf4_structure_v2,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -514,14 +518,17 @@ def resolve_source_np_db(
         float(args.core_radius_a),
         outer_radius_a - SURFACE_LAYER_THICKNESS_A,
     )
+    host_structure = get_nayf4_structure_v2()
     if surface_enabled:
         constraints = [
-            SphericalConstraint(float(args.core_radius_a)),
-            SphericalConstraint(surface_inner_radius_a),
-            SphericalConstraint(outer_radius_a),
+            SphericalConstraint(float(args.core_radius_a), host_structure),
+            SphericalConstraint(surface_inner_radius_a, host_structure),
+            SphericalConstraint(outer_radius_a, host_structure),
         ]
         dopant_specification = [
+            (0, 0.25, "Na", "Y"),
             (0, tm_fraction, "Tm", "Y"),
+            (2, 0.25, "Na", "Y"),
             (
                 2,
                 float(config["surface_fraction"]),
@@ -531,10 +538,13 @@ def resolve_source_np_db(
         ]
     else:
         constraints = [
-            SphericalConstraint(float(args.core_radius_a)),
-            SphericalConstraint(outer_radius_a),
+            SphericalConstraint(float(args.core_radius_a), host_structure),
+            SphericalConstraint(outer_radius_a, host_structure),
         ]
-        dopant_specification = [(0, tm_fraction, "Tm", "Y")]
+        dopant_specification = [
+            (0, 0.25, "Na", "Y"),
+            (0, tm_fraction, "Tm", "Y"),
+        ]
     nanoparticle = DopedNanoparticle(
         constraints=constraints,
         dopant_specification=dopant_specification,
