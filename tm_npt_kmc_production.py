@@ -10,15 +10,16 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 # Matplotlib requires a writable cache directory; default locations can be
 # read-only on HPC filesystems, so force a writable tmpfs path before importing
@@ -36,7 +37,7 @@ import plot_mechanism_diagrams
 import plot_n4_convergence
 from convergence_diagnostic import (
     compute_n4_late_window_averages,
-    replay_trajectories,
+    replay_trajectories as _replay_trajectories,
     TM_SPECIES_ID,
     N4_LEVEL,
     Q21_CHANNEL_NAME,
@@ -149,6 +150,62 @@ def json_safe(value: Any) -> Any:
 def utc_now_iso() -> str:
     """Return an unambiguous timestamp for run-history records."""
     return datetime.now(timezone.utc).isoformat()
+
+
+_CHECKPOINT_REQUESTED = False
+_CONTINUE_RUN = False
+
+
+class CheckpointRequested(Exception):
+    """A clean walltime pause, distinct from simulation or analysis failures."""
+
+
+def checkpoint_boundary() -> None:
+    if _CHECKPOINT_REQUESTED:
+        raise CheckpointRequested()
+
+
+def request_checkpoint(_signum: int, _frame: Any) -> None:
+    global _CHECKPOINT_REQUESTED
+    _CHECKPOINT_REQUESTED = True
+
+
+def checkpoint_futures(futures: Iterable[Future]) -> Iterator[Future]:
+    """Drain workers on pause, but never hide a real error behind that pause."""
+    error: BaseException | None = None
+    for future in as_completed(futures):
+        if not _CONTINUE_RUN:
+            yield future
+        elif future.exception() is not None:
+            request_checkpoint(signal.SIGUSR1, None)
+            if error is None or isinstance(error, CheckpointRequested):
+                error = future.exception()
+        else:
+            yield future
+    if error is not None:
+        raise error
+
+
+def atomic_json(path: Path, data: Any) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    with open(temporary, "w") as handle:
+        json.dump(json_safe(data), handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+
+
+def replay_trajectories(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    checkpoint_boundary()
+    if _CONTINUE_RUN:
+        kwargs["stop_requested"] = lambda: _CHECKPOINT_REQUESTED
+    try:
+        result = _replay_trajectories(*args, **kwargs)
+    except (InterruptedError, sqlite3.OperationalError):
+        checkpoint_boundary()
+        raise
+    checkpoint_boundary()
+    return result
 
 
 def resume_manifest_fingerprint(manifest: dict[str, Any]) -> str:
@@ -1453,11 +1510,21 @@ def write_custom_npmc_databases(
     interactions: list[dict[str, Any]],
     interaction_radius_bound_nm: float,
     distance_factor_type: str,
+    reuse_existing: bool = False,
 ) -> tuple[Path, Path]:
     """Write custom NPMC databases for one excitation power."""
     output_dir.mkdir(parents=True, exist_ok=True)
     np_db_path = output_dir / "np.sqlite"
     initial_state_db_path = output_dir / "initial_state.sqlite"
+    ready_path = output_dir / ".database_ready.json"
+    if reuse_existing and any(
+        path.exists() for path in (ready_path, np_db_path, initial_state_db_path)
+    ):
+        if not all(
+            path.exists() for path in (ready_path, np_db_path, initial_state_db_path)
+        ):
+            raise RuntimeError(f"Incomplete database initialization in {output_dir}")
+        return np_db_path, initial_state_db_path
     for path in (np_db_path, initial_state_db_path):
         if path.exists():
             path.unlink()
@@ -1614,6 +1681,8 @@ def write_custom_npmc_databases(
         )
         con.commit()
 
+    if reuse_existing:
+        atomic_json(ready_path, {"ready": True})
     return np_db_path, initial_state_db_path
 
 
@@ -1627,6 +1696,58 @@ def run_npmc(
     simulation_time_cutoff_s: float | None,
 ) -> dict[str, Any]:
     """Run NPMC on the custom databases."""
+    checkpoint_boundary()
+    continuing = bool(getattr(args, "continue_run", False))
+    checkpoint_path = output_dir / ".npmc_checkpoint.json"
+    completed_seeds: list[int] = []
+    saved_states: list[tuple] = []
+    saved_cutoffs: list[tuple] = []
+    last_rowid = 0
+    if continuing:
+        if checkpoint_path.exists():
+            if json.loads(checkpoint_path.read_text())["status"] != "ready":
+                raise RuntimeError(
+                    f"Unclean NPMC exit in {output_dir}; refusing an unverified "
+                    "checkpoint. Inspect the database before restarting."
+                )
+            progress = validate_npmc_checkpoint(
+                initial_state_db_path,
+                final_step_cutoff=int(simulation_step_cutoff),
+                base_seed=int(args.base_seed),
+                num_sims=int(args.num_sims),
+                allow_partial=True,
+            )
+            completed_seeds = [
+                seed for seed, step in progress.items()
+                if step == int(simulation_step_cutoff) + 1
+            ]
+            if len(completed_seeds) == int(args.num_sims):
+                return {"reused_checkpoint": True}
+        else:
+            with sqlite3.connect(initial_state_db_path) as con:
+                if any(
+                    con.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                    for table in ("trajectories", "interrupt_state", "interrupt_cutoff")
+                ):
+                    raise RuntimeError(f"Unverified existing trajectory in {output_dir}")
+
+        # NPMC executes one event before testing the cutoff, even for finished
+        # seeds. Preserve their endpoints while the other seeds catch up.
+        if completed_seeds:
+            placeholders = ",".join("?" for _ in completed_seeds)
+            with sqlite3.connect(initial_state_db_path) as con:
+                saved_states = con.execute(
+                    f"SELECT * FROM interrupt_state WHERE seed IN ({placeholders})",
+                    completed_seeds,
+                ).fetchall()
+                saved_cutoffs = con.execute(
+                    f"SELECT * FROM interrupt_cutoff WHERE seed IN ({placeholders})",
+                    completed_seeds,
+                ).fetchall()
+                last_rowid = con.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM trajectories"
+                ).fetchone()[0]
+
     run_args = [
         args.npmc_command,
         f"--nano_particle_database={np_db_path}",
@@ -1653,8 +1774,34 @@ def run_npmc(
         stderr_start_offset = 0
 
     print(f'Running NPMC using the command: "{" ".join(run_args)}"', flush=True)
+    if continuing:
+        atomic_json(checkpoint_path, {"status": "running"})
     with open(output_dir / "stdout", "a") as f_std, open(stderr_path, "a") as f_err:
-        subprocess.run(run_args, stdout=f_std, stderr=f_err, check=True)
+        with subprocess.Popen(run_args, stdout=f_std, stderr=f_err) as process:
+            signalled = False
+            while process.poll() is None:
+                if _CHECKPOINT_REQUESTED and not signalled:
+                    # NPMC installs its handler after loading the model. Sending
+                    # SIGTERM before then would kill it without a checkpoint.
+                    try:
+                        status = Path(f"/proc/{process.pid}/status").read_text()
+                        caught = next(
+                            line.split()[1] for line in status.splitlines()
+                            if line.startswith("SigCgt:")
+                        )
+                        if int(caught, 16) & (1 << (signal.SIGTERM - 1)):
+                            process.send_signal(signal.SIGTERM)
+                            signalled = True
+                    except ProcessLookupError:
+                        pass
+                    except FileNotFoundError:
+                        pass
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+            if process.returncode:
+                raise subprocess.CalledProcessError(process.returncode, run_args)
 
     with open(stderr_path, "r", errors="replace") as f_err:
         f_err.seek(stderr_start_offset)
@@ -1677,6 +1824,30 @@ def run_npmc(
             f"({details}); refusing to summarize an untrusted trajectory. "
             f"See {stderr_path} from byte {stderr_start_offset}."
         )
+    if continuing:
+        if completed_seeds:
+            with sqlite3.connect(initial_state_db_path) as con:
+                con.execute(
+                    f"DELETE FROM trajectories WHERE rowid > ? "
+                    f"AND seed IN ({placeholders})",
+                    [last_rowid, *completed_seeds],
+                )
+                for table in ("interrupt_state", "interrupt_cutoff"):
+                    con.execute(
+                        f"DELETE FROM {table} WHERE seed IN ({placeholders})",
+                        completed_seeds,
+                    )
+                con.executemany("INSERT INTO interrupt_state VALUES (?, ?, ?)", saved_states)
+                con.executemany("INSERT INTO interrupt_cutoff VALUES (?, ?, ?)", saved_cutoffs)
+        validate_npmc_checkpoint(
+            initial_state_db_path,
+            final_step_cutoff=int(simulation_step_cutoff),
+            base_seed=int(args.base_seed),
+            num_sims=int(args.num_sims),
+            allow_partial=_CHECKPOINT_REQUESTED,
+        )
+        atomic_json(checkpoint_path, {"status": "ready", "attempt": attempt})
+        checkpoint_boundary()
     return attempt
 
 
@@ -1686,7 +1857,8 @@ def validate_npmc_checkpoint(
     final_step_cutoff: int,
     base_seed: int,
     num_sims: int,
-) -> None:
+    allow_partial: bool = False,
+) -> dict[int, int]:
     """Verify that NPMC checkpoint tables are complete for a step cutoff.
 
     This is used both immediately after an NPMC run and before resuming one.
@@ -1719,7 +1891,12 @@ def validate_npmc_checkpoint(
     expected_cutoff_step = int(final_step_cutoff) + 1
     if (
         set(cutoff_by_seed) != set(expected_seeds)
-        or any(step != expected_cutoff_step for step in cutoff_by_seed.values())
+        or len(cutoff_rows) != len(expected_seeds)
+        or any(
+            not (0 <= step <= expected_cutoff_step)
+            if allow_partial else step != expected_cutoff_step
+            for step in cutoff_by_seed.values()
+        )
         or set(state_counts) != set(expected_seeds)
         or any(
             total_count != site_count or distinct_site_count != site_count
@@ -1730,6 +1907,7 @@ def validate_npmc_checkpoint(
             "NPMC checkpoint is incomplete for one or more expected seeds; "
             "refusing to use an untrusted trajectory."
         )
+    return cutoff_by_seed
 
 
 def validate_replay_completion(
@@ -1973,7 +2151,7 @@ def finalize_prepared_seed_databases(
     seed_records: list[dict[str, Any]],
     *,
     output_dir: Path,
-    archive_root: Path,
+    archive_root: Path | None,
 ) -> dict[str, str]:
     """Archive target trajectories and retain per-seed links in the run tree."""
     paths: dict[str, str] = {}
@@ -2070,7 +2248,7 @@ def run_power_point(
     tm_fraction: float | None,
     config: dict[str, Any],
     args: argparse.Namespace,
-    trajectory_archive_root: Path,
+    trajectory_archive_root: Path | None,
     local_db_staging_root: Path | None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Build and optionally run one power point."""
@@ -2227,6 +2405,7 @@ def run_power_point(
                 distance_factor_type=str(
                     params["simulation_defaults"]["distance_factor_type"]
                 ),
+                reuse_existing=args.continue_run,
             )
             simulation_step_cutoff = base_simulation_step_cutoff
             simulation_time_cutoff_s = base_simulation_time_cutoff_s
@@ -2397,7 +2576,7 @@ def run_fresh_prepared_power_point(
     tm_fraction: float | None,
     config: dict[str, Any],
     args: argparse.Namespace,
-    trajectory_archive_root: Path,
+    trajectory_archive_root: Path | None,
     local_db_staging_root: Path | None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Run a fixed-50k preparation followed by target-only trajectories."""
@@ -2462,6 +2641,7 @@ def run_fresh_prepared_power_point(
         distance_factor_type=str(
             params["simulation_defaults"]["distance_factor_type"]
         ),
+        reuse_existing=args.continue_run,
     )
     with open(preparation_dir / "npt_interaction_manifest.json", "w") as handle:
         json.dump(json_safe(preparation_manifest), handle, indent=2)
@@ -2507,6 +2687,21 @@ def run_fresh_prepared_power_point(
         )
         initial_state_db_path = work_dir / "initial_state.sqlite"
         np_db_path = work_dir / "np.sqlite"
+        preparation_path = seed_dir / "preparation_state.json"
+        if args.continue_run and initial_state_db_path.exists():
+            if not preparation_path.exists() or not np_db_path.exists():
+                raise RuntimeError(f"Incomplete seed initialization in {seed_dir}")
+            seed_preparation[str(seed)] = json.loads(preparation_path.read_text())
+            seed_records.append(
+                {
+                    "seed": seed,
+                    "seed_dir": seed_dir,
+                    "work_dir": work_dir,
+                    "np_db_path": np_db_path,
+                    "initial_state_db_path": initial_state_db_path,
+                }
+            )
+            continue
         shutil.copy2(template_state_path, initial_state_db_path)
         link_target_np_database(np_db_path, output_dir / "np.sqlite")
         preparation_record: dict[str, Any] = {
@@ -2531,8 +2726,7 @@ def run_fresh_prepared_power_point(
                 }
             )
         seed_preparation[str(seed)] = preparation_record
-        with open(seed_dir / "preparation_state.json", "w") as handle:
-            json.dump(json_safe(preparation_record), handle, indent=2)
+        atomic_json(preparation_path, preparation_record)
         seed_records.append(
             {
                 "seed": seed,
@@ -2596,7 +2790,7 @@ def run_fresh_prepared_power_point(
             ): int(record["seed"])
             for record in seed_records
         }
-        for future in as_completed(futures):
+        for future in checkpoint_futures(futures):
             seed = futures[future]
             future.result()
             print(f"Target restart complete for seed {seed}", flush=True)
@@ -2648,7 +2842,7 @@ def run_resumed_prepared_power_point(
     tm_fraction: float | None,
     config: dict[str, Any],
     args: argparse.Namespace,
-    trajectory_archive_root: Path,
+    trajectory_archive_root: Path | None,
     local_db_staging_root: Path | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Extend existing per-seed target checkpoints without rerunning preparation."""
@@ -2742,7 +2936,7 @@ def run_resumed_prepared_power_point(
                 ): int(record["seed"])
                 for record in seed_records
             }
-            for future in as_completed(futures):
+            for future in checkpoint_futures(futures):
                 seed = futures[future]
                 future.result()
                 print(
@@ -2821,6 +3015,24 @@ def run_resumed_prepared_power_point(
 
 
 def run_configured_power_point(
+    **kwargs: Any,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    checkpoint_boundary()
+    output_dir = Path(kwargs["output_root"]) / (
+        f"power_{kwargs['power_index']:02d}_{kwargs['power']:.6g}"
+    )
+    done_path = output_dir / ".power_complete.json"
+    if kwargs["args"].continue_run and done_path.exists():
+        record = json.loads(done_path.read_text())
+        return record["build_record"], record["summary"]
+    result = _run_configured_power_point(**kwargs)
+    checkpoint_boundary()
+    if kwargs["args"].continue_run:
+        atomic_json(done_path, {"build_record": result[0], "summary": result[1]})
+    return result
+
+
+def _run_configured_power_point(
     **kwargs: Any,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Select the cold-start or fixed-preparation production path."""
@@ -2992,7 +3204,7 @@ def plot_npt_style_spectrum(
 def finalize_initial_state_database(
     initial_state_db_path: Path,
     output_dir: Path,
-    archive_root: Path,
+    archive_root: Path | None,
 ) -> Path:
     """Materialize the completed trajectory DB in the final output location."""
     if not initial_state_db_path.exists():
@@ -3000,6 +3212,8 @@ def finalize_initial_state_database(
             f"Missing completed trajectory database: {initial_state_db_path}"
         )
     final_initial_state_db_path = output_dir / "initial_state.sqlite"
+    if archive_root is None:
+        return move_output_file(initial_state_db_path, final_initial_state_db_path)
     if initial_state_db_path.is_symlink():
         archived_path = initial_state_db_path.resolve()
         if final_initial_state_db_path != initial_state_db_path:
@@ -3925,6 +4139,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-zero-rates", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Build DBs and manifests but skip NPMC.")
     parser.add_argument(
+        "--continue-run",
+        action="store_true",
+        help=(
+            "Start or continue a checkpointed sweep to the same absolute cutoff. "
+            "Requires its own output root; SIGUSR1 requests a clean pause (exit 75). "
+            "Keeps databases in that root and retries unfinished analysis."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -4073,9 +4296,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    parser = build_arg_parser()
-    args = parser.parse_args()
+def run_production(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.replot_last_steps is not None:
         if args.replot_last_steps <= 0:
             parser.error("--replot-last-steps must be positive")
@@ -4118,6 +4339,8 @@ def main() -> None:
     params = rates.load_sk_parameters(args.params)
     config = resolve_production_config(args, params)
     output_root = Path(args.output_root) if args.output_root else next_run_dir()
+    if not args.continue_run and (output_root / ".chain_state.json").exists():
+        parser.error("This is a checkpoint-chain output root; use --continue-run.")
     if args.resume and not output_root.is_dir():
         parser.error(f"--resume requires existing output root: {output_root}")
     output_root.mkdir(parents=True, exist_ok=True)
@@ -4125,7 +4348,9 @@ def main() -> None:
     existing_sweep_summary = (
         _load_existing_sweep_summary(output_root) if args.resume else None
     )
-    trajectory_archive_root = Path(args.trajectory_archive_root).expanduser()
+    trajectory_archive_root = (
+        None if args.continue_run else Path(args.trajectory_archive_root).expanduser()
+    )
     source_np_db_path = resolve_source_np_db(args, params, output_root, config)
     print(f"Using source geometry database: {source_np_db_path}", flush=True)
 
@@ -4159,7 +4384,7 @@ def main() -> None:
     power_parallel_workers = min(power_parallel_workers, len(powers))
     auto_power_parallel = power_parallel_workers > 1
     local_db_staging_root = (
-        None if args.dry_run else resolve_local_db_staging_root()
+        None if args.dry_run or args.continue_run else resolve_local_db_staging_root()
     )
     if local_db_staging_root is not None:
         print(
@@ -4217,7 +4442,10 @@ def main() -> None:
             if local_db_staging_root is None
             else str(local_db_staging_root.resolve())
         ),
-        "trajectory_archive_root": str(trajectory_archive_root.resolve()),
+        "trajectory_archive_root": (
+            None if trajectory_archive_root is None
+            else str(trajectory_archive_root.resolve())
+        ),
         "simulation_cutoff_mode": args.resolved_cutoff_mode,
         "simulation_step_cutoff": (
             None
@@ -4300,7 +4528,7 @@ def main() -> None:
                 ): (power_index, power)
                 for power_index, power in power_jobs
             }
-            for future in as_completed(future_to_job):
+            for future in checkpoint_futures(future_to_job):
                 build_record, summary = future.result()
                 build_records.append(build_record)
                 if summary is not None:
@@ -4444,5 +4672,77 @@ def main() -> None:
         plot_avalanche_curve(sweep_summaries, output_root, resume=args.resume)
 
 
+def main() -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    if not args.continue_run:
+        run_production(args, parser)
+        return 0
+    if (
+        not args.output_root or args.resume or args.skip_npmc or args.dry_run
+        or args.regenerate_geometry or args.resume_power_indices is not None
+        or args.replot_last_steps is not None
+        or resolve_simulation_cutoff(args)[0] != "steps"
+    ):
+        parser.error(
+            "--continue-run requires --output-root and step cutoffs; it cannot "
+            "be combined with resume, dry-run, skip, replot, or geometry regeneration."
+        )
+    output_root = Path(args.output_root).expanduser().resolve()
+    args.output_root = str(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    # Never unlink this lock: all jobs must lock the same inode.
+    with open(output_root / ".chain.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        state_path = output_root / ".chain_state.json"
+        settings = vars(args).copy()
+        for key in (
+            "thread_count", "restart_workers", "power_parallel_workers",
+            "power_parallel_total_slots",
+        ):
+            settings.pop(key)
+        settings["params_contents"] = rates.load_sk_parameters(args.params)
+        if args.source_np_db:
+            settings["source_np_db_sha256"] = hashlib.sha256(
+                Path(args.source_np_db).read_bytes()
+            ).hexdigest()
+        fingerprint = hashlib.sha256(
+            json.dumps(json_safe(settings), sort_keys=True).encode()
+        ).hexdigest()
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            if state["fingerprint"] != fingerprint:
+                parser.error("Continuation settings changed; use the original settings.")
+            if state["status"] == "complete":
+                print("Sweep and post-analysis are already complete.", flush=True)
+                return 0
+        else:
+            if any(output_root.glob("power_*")):
+                parser.error("--continue-run requires a new, dedicated output root.")
+            state = {"fingerprint": fingerprint, "status": "pending"}
+            atomic_json(state_path, state)
+        global _CONTINUE_RUN, _CHECKPOINT_REQUESTED
+        _CONTINUE_RUN = True
+        _CHECKPOINT_REQUESTED = False
+        handlers = {
+            sig: signal.signal(sig, request_checkpoint)
+            for sig in (signal.SIGUSR1, signal.SIGTERM, signal.SIGINT)
+        }
+        try:
+            run_production(args, parser)
+            checkpoint_boundary()
+            state["status"] = "complete"
+            atomic_json(state_path, state)
+        except CheckpointRequested:
+            print("Checkpoint saved; simulation or post-analysis will continue next job.", flush=True)
+            return 75
+        finally:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+            _CONTINUE_RUN = False
+            _CHECKPOINT_REQUESTED = False
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

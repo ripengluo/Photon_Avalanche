@@ -16,15 +16,15 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 JOB_TAG="${SLURM_JOB_ID:-manual}"
-OUTPUT_ROOT="14nm-8p0Tm"
+OUTPUT_ROOT="${OUTPUT_ROOT:-14nm-8p0Tm}"
 ARCHIVE_ROOT="${ARCHIVE_ROOT:-/home/rpluo/Desktop/hdd_large/KMC_trajectories/accelerate_convergence}"
-TOTAL_SLOTS="${SLURM_NTASKS:-24}"
+TOTAL_SLOTS="$(( ${SLURM_NTASKS:-24} * ${SLURM_CPUS_PER_TASK:-1} ))"
 
 echo "output_root=$OUTPUT_ROOT"
 echo "archive_root=$ARCHIVE_ROOT"
 echo "total_slots=$TOTAL_SLOTS"
 
-python -B ./tm_npt_kmc_production.py \
+exec python -B ./tm_npt_kmc_production.py \
   --output-root "$OUTPUT_ROOT" \
   --trajectory-archive-root "$ARCHIVE_ROOT" \
   --power-sampling-mode centered-gaussian \
