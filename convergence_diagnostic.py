@@ -14,7 +14,7 @@ import os
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -53,6 +53,7 @@ def replay_trajectories(
     q21_channel_name: str = Q21_CHANNEL_NAME,
     n4_trace_samples: int | None = None,
     n4_trace_final_step: int | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Read trajectory observables and optionally sample bounded N4 traces.
 
@@ -156,6 +157,9 @@ def replay_trajectories(
 
     with sqlite3.connect(resolved_initial_state_db_path) as con:
         con.execute("PRAGMA journal_mode = MEMORY")
+        if stop_requested is not None:
+            # Also interrupt the potentially long SQLite sort before replay.
+            con.set_progress_handler(lambda: int(stop_requested()), 100_000)
         checkpoint_times = {
             int(seed): float(time_s)
             for seed, time_s in con.execute(
@@ -210,6 +214,8 @@ def replay_trajectories(
             current_late_integral_2 += current_n4_count * overlap_2
 
         for seed, step, event_time, site_id_1, site_id_2, interaction_id in rows:
+            if stop_requested is not None and step % 16_384 == 0 and stop_requested():
+                raise InterruptedError("Checkpoint requested during trajectory replay")
             seed = int(seed)
             step = int(step)
             event_time = float(event_time)
